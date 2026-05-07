@@ -4,6 +4,8 @@ LongContextBench is a long-context benchmark CLI for testing how well LLMs recal
 
 The `longctx` binary can generate synthetic benchmark suites, run them against OpenAI-compatible chat completion APIs, and turn JSONL results into a local HTML report.
 
+Design and configuration notes live in [docs/configuration.md](docs/configuration.md), [docs/productionization.md](docs/productionization.md), and [docs/schema-migration.md](docs/schema-migration.md).
+
 ## Install
 
 ```sh
@@ -28,6 +30,8 @@ longctx generate multi-needle --tokens 100000 --out ./bench
 longctx generate conflict --tokens 100000 --out ./bench
 ```
 
+Add `--seed <value>` to make generation reproducible.
+
 ### `run`
 
 Run generated benchmark cases against an OpenAI-compatible provider. The benchmark directory must contain a `config.toml` file.
@@ -38,13 +42,42 @@ longctx run ./bench
 
 Results are written to `./bench/results.jsonl`.
 
+### `validate`
+
+Validate a benchmark directory before running it.
+
+```sh
+longctx validate ./bench
+```
+
+Use `--skip-api-key-check` when you only want to check files and schema.
+
 ### `report`
 
 Generate a standalone HTML report from a results JSONL file.
 
 ```sh
 longctx report ./bench/results.jsonl --out report.html
+longctx report ./bench/results.jsonl --json
+longctx report ./bench/results.jsonl --json --out report.json
 ```
+
+The report includes per-suite summaries, per-token-count summaries, trend charts, and failure groups.
+`--json` emits a machine-readable summary.
+
+### `compare`
+
+Compare two result files.
+
+```sh
+longctx compare baseline.jsonl candidate.jsonl
+longctx compare baseline.jsonl candidate.jsonl --json
+longctx compare baseline.jsonl candidate.jsonl --html-out compare.html
+longctx compare baseline.jsonl candidate.jsonl --fail-on-regression
+```
+
+`compare --json` emits machine-readable deltas, including average latency and token changes.
+`compare --html-out` writes a standalone comparison report.
 
 ## Quick Start
 
@@ -61,6 +94,12 @@ Create `./bench/config.toml`:
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 model = "gpt-4.1"
+
+[run]
+request_timeout_secs = 120
+max_retries = 2
+retry_backoff_ms = 500
+concurrency = 4
 ```
 
 Run the benchmark:
@@ -92,6 +131,13 @@ Fields:
 - `base_url`: Provider base URL. The runner posts to `{base_url}/chat/completions`.
 - `api_key_env`: Name of the environment variable containing the API key.
 - `model`: Model name sent in the chat completion request.
+- `request_timeout_secs`: Per-request timeout in seconds.
+- `max_retries`: Retry budget for transient failures.
+- `retry_backoff_ms`: Base retry delay in milliseconds.
+- `concurrency`: Number of benchmark requests to run in parallel.
+- `request_style`: Provider request style, either `chat-completions` or `responses`.
+- `log_requests`: Write opt-in redacted HTTP exchange logs under `reports/`.
+- `request_log_path`: Path for the request log file, defaulting to `reports/http-log.jsonl`.
 
 Any provider that exposes an OpenAI-compatible `/chat/completions` endpoint can be used by changing `base_url`, `api_key_env`, and `model`.
 
@@ -99,10 +145,13 @@ Any provider that exposes an OpenAI-compatible `/chat/completions` endpoint can 
 
 Each generated suite writes:
 
-- A context text file, such as `needle_context.txt`.
-- A suite manifest JSON file, such as `needle.json`.
+- A context text file under `contexts/`.
+- A suite manifest JSON file under `manifests/`.
 
 The runner accepts generated suite manifests and writes newline-delimited JSON results to `results.jsonl`.
+Result rows include the suite name, token count, provider model, HTTP status, provider request ID, rate-limit headers, attempt count, and structured error kind when a run fails.
+Each run also writes a `run.json` snapshot with config and timing metadata.
+When `run.log_requests` is enabled, redacted HTTP exchange logs are written to `reports/http-log.jsonl`.
 
 ## Contributing
 
@@ -118,5 +167,6 @@ Useful local checks:
 ```sh
 cargo fmt --check
 cargo test
+cargo clippy --all-targets -- -D warnings
 cargo build
 ```

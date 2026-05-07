@@ -1,13 +1,20 @@
-use crate::benchmark::{BenchmarkResult, Config, ProviderConfig, SuiteManifest, TestCase};
+use crate::benchmark::{
+    BenchmarkResult, Config, ErrorKind, ProviderConfig, RunConfig, RunMetadata, SuiteManifest,
+    TestCase, SCHEMA_VERSION,
+};
 use crate::grader::grade;
 use anyhow::{anyhow, Context, Result};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::task::JoinSet;
+use tokio::time::sleep;
 use walkdir::WalkDir;
 
 pub async fn run_benchmarks(bench_dir: &str) -> Result<()> {
@@ -26,6 +33,18 @@ pub async fn run_benchmarks(bench_dir: &str) -> Result<()> {
     }
 
     let results_path = bench_path.join("results.jsonl");
+    let metadata_path = bench_path.join("run.json");
+    let run_started = Instant::now();
+    let started_at_unix_ms = unix_ms_now();
+    let mut metadata = build_run_metadata(
+        bench_path,
+        &results_path,
+        started_at_unix_ms,
+        &config,
+        &tests,
+    );
+    write_run_metadata(&metadata_path, &metadata)?;
+
     let mut results_file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -33,18 +52,191 @@ pub async fn run_benchmarks(bench_dir: &str) -> Result<()> {
         .open(&results_path)
         .with_context(|| format!("failed to open {}", results_path.display()))?;
 
-    let client = Client::new();
-    for test in tests {
-        let result = run_one(&client, &config.provider, &api_key, bench_path, &test).await;
+    let client = Client::builder()
+        .build()
+        .context("failed to build HTTP client")?;
+    let tests_for_run = tests.clone();
+    let results = run_all(
+        client,
+        config.provider.clone(),
+        config.run.clone(),
+        api_key,
+        bench_path.to_path_buf(),
+        tests_for_run,
+    )
+    .await?;
+
+    for result in &results {
         writeln!(results_file, "{}", serde_json::to_string(&result)?)?;
+    }
+    if config.run.log_requests {
+        let log_path = bench_path.join(&config.run.request_log_path);
+        write_request_logs(bench_path, &log_path, &tests, &results)?;
+    }
+    metadata.finished_at_unix_ms = Some(unix_ms_now());
+    metadata.duration_ms = Some(run_started.elapsed().as_millis() as u64);
+    write_run_metadata(&metadata_path, &metadata)?;
+
+    Ok(())
+}
+
+fn build_run_metadata(
+    bench_path: &Path,
+    results_path: &Path,
+    started_at_unix_ms: u64,
+    config: &Config,
+    tests: &[TestCase],
+) -> RunMetadata {
+    RunMetadata {
+        schema_version: SCHEMA_VERSION,
+        bench_dir: bench_path.to_string_lossy().into_owned(),
+        results_path: results_path.to_string_lossy().into_owned(),
+        started_at_unix_ms,
+        finished_at_unix_ms: None,
+        duration_ms: None,
+        test_count: tests.len(),
+        provider_model: config.provider.model.clone(),
+        provider_base_url: config.provider.base_url.clone(),
+        provider_request_style: config.provider.request_style.as_str().to_string(),
+        request_timeout_secs: config.run.request_timeout_secs,
+        max_retries: config.run.max_retries,
+        retry_backoff_ms: config.run.retry_backoff_ms,
+        concurrency: config.run.concurrency.max(1),
+        log_requests: config.run.log_requests,
+        request_log_path: if config.run.log_requests {
+            Some(config.run.request_log_path.clone())
+        } else {
+            None
+        },
+        suites: suite_names(tests),
+    }
+}
+
+fn write_run_metadata(path: &Path, metadata: &RunMetadata) -> Result<()> {
+    let json = serde_json::to_string_pretty(metadata)?;
+    fs::write(path, json).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn write_request_logs(
+    bench_path: &Path,
+    log_path: &Path,
+    tests: &[TestCase],
+    results: &[BenchmarkResult],
+) -> Result<()> {
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create log directory {}", parent.display()))?;
+    }
+
+    let mut log_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(log_path)
+        .with_context(|| format!("failed to open request log {}", log_path.display()))?;
+
+    for (test, result) in tests.iter().zip(results.iter()) {
+        let request_hash = load_context(bench_path, &test.context)
+            .map(|context| build_prompt(&context, &test.question))
+            .map(|prompt| sha256_hex(&prompt))
+            .ok();
+        let response_hash = result
+            .answer
+            .as_ref()
+            .or(result.error.as_ref())
+            .map(|body| sha256_hex(body));
+        let entry = HttpExchangeLog {
+            schema_version: SCHEMA_VERSION,
+            logged_at_unix_ms: unix_ms_now(),
+            id: result.id.clone(),
+            suite: result.suite.clone(),
+            request_id: result.request_id.clone(),
+            http_status: result.http_status,
+            attempts: result.attempts,
+            latency_ms: result.latency_ms,
+            input_tokens: result.input_tokens,
+            output_tokens: result.output_tokens,
+            passed: result.passed,
+            error_kind: result.error_kind.clone(),
+            request_sha256: request_hash,
+            response_sha256: response_hash,
+        };
+        writeln!(log_file, "{}", serde_json::to_string(&entry)?)?;
     }
 
     Ok(())
 }
 
+fn suite_names(tests: &[TestCase]) -> Vec<String> {
+    let mut suites = tests
+        .iter()
+        .filter_map(suite_name)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if suites.is_empty() {
+        suites.push("unknown".to_string());
+    }
+    suites
+}
+
+fn unix_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+async fn run_all(
+    client: Client,
+    provider: ProviderConfig,
+    run: RunConfig,
+    api_key: String,
+    bench_path: PathBuf,
+    tests: Vec<TestCase>,
+) -> Result<Vec<BenchmarkResult>> {
+    let concurrency = run.concurrency.max(1);
+    let total = tests.len();
+    let mut ordered = vec![None; total];
+    let mut tasks = JoinSet::new();
+
+    for (idx, test) in tests.into_iter().enumerate() {
+        while tasks.len() >= concurrency {
+            let (completed_idx, result) = tasks
+                .join_next()
+                .await
+                .context("benchmark task set ended unexpectedly")?
+                .context("benchmark task panicked")?;
+            ordered[completed_idx] = Some(result);
+        }
+
+        let client = client.clone();
+        let provider = provider.clone();
+        let run = run.clone();
+        let api_key = api_key.clone();
+        let bench_path = bench_path.clone();
+        tasks.spawn(async move {
+            let result = run_one(&client, &provider, &run, &api_key, &bench_path, &test).await;
+            (idx, result)
+        });
+    }
+
+    while let Some(joined) = tasks.join_next().await {
+        let (idx, result) = joined.context("benchmark task panicked")?;
+        ordered[idx] = Some(result);
+    }
+
+    ordered
+        .into_iter()
+        .enumerate()
+        .map(|(idx, result)| result.with_context(|| format!("missing result for test index {idx}")))
+        .collect()
+}
+
 async fn run_one(
     client: &Client,
     provider: &ProviderConfig,
+    run: &RunConfig,
     api_key: &str,
     bench_dir: &Path,
     test: &TestCase,
@@ -54,138 +246,418 @@ async fn run_one(
         Ok(context) => context,
         Err(error) => {
             return BenchmarkResult {
+                schema_version: SCHEMA_VERSION,
+                suite: suite_name(test),
+                token_count: test_token_count(test),
                 id: test.id.clone(),
+                provider_model: Some(provider.model.clone()),
+                provider_base_url: Some(provider.base_url.clone()),
+                http_status: None,
+                request_id: None,
+                rate_limit_remaining: None,
+                rate_limit_reset: None,
                 passed: false,
+                attempts: 0,
                 latency_ms: 0,
                 input_tokens: 0,
                 output_tokens: 0,
                 answer: None,
                 error: Some(error.to_string()),
+                error_kind: Some(ErrorKind::ContextLoad),
             };
         }
     };
-    let prompt = format!(
-        "Use the context to answer the question.\n\nContext:\n{context}\n\nQuestion:\n{}\n\nAnswer:",
-        test.question
-    );
+    let prompt = build_prompt(&context, &test.question);
     let input_tokens = estimate_tokens(&prompt);
 
+    let response = match provider.request_style {
+        crate::benchmark::ProviderRequestStyle::ChatCompletions => {
+            send_chat_completion(client, run, provider, api_key, &prompt, input_tokens).await
+        }
+        crate::benchmark::ProviderRequestStyle::Responses => {
+            send_responses(client, run, provider, api_key, &prompt, input_tokens).await
+        }
+    };
+
+    match response {
+        Ok(output) => {
+            let passed = grade(&output.answer, test);
+            BenchmarkResult {
+                schema_version: SCHEMA_VERSION,
+                suite: suite_name(test),
+                token_count: test_token_count(test),
+                id: test.id.clone(),
+                provider_model: Some(provider.model.clone()),
+                provider_base_url: Some(provider.base_url.clone()),
+                http_status: output.http_status,
+                request_id: output.request_id,
+                rate_limit_remaining: output.rate_limit_remaining,
+                rate_limit_reset: output.rate_limit_reset,
+                passed,
+                attempts: output.attempts,
+                latency_ms: started.elapsed().as_millis() as u64,
+                input_tokens: output.input_tokens,
+                output_tokens: output.output_tokens,
+                answer: Some(output.answer),
+                error: if passed {
+                    None
+                } else {
+                    Some("answer did not satisfy grader".to_string())
+                },
+                error_kind: if passed {
+                    None
+                } else {
+                    Some(ErrorKind::Validation)
+                },
+            }
+        }
+        Err(failure) => error_result(ErrorResultInput {
+            test,
+            provider,
+            started,
+            input_tokens,
+            attempts: failure.attempts,
+            kind: failure.kind,
+            http_status: failure.http_status,
+            request_id: failure.request_id,
+            rate_limit_remaining: failure.rate_limit_remaining,
+            rate_limit_reset: failure.rate_limit_reset,
+            error: failure.error,
+        }),
+    }
+}
+
+async fn send_chat_completion(
+    client: &Client,
+    run: &RunConfig,
+    provider: &ProviderConfig,
+    api_key: &str,
+    prompt: &str,
+    input_tokens: u64,
+) -> std::result::Result<ProviderOutput, ProviderFailure> {
     let request = ChatCompletionRequest {
         model: provider.model.clone(),
         messages: vec![ChatMessage {
             role: "user".to_string(),
-            content: prompt,
+            content: prompt.to_string(),
         }],
         temperature: 0.0,
     };
-
-    let url = format!("{}/chat/completions", provider.base_url.trim_end_matches('/'));
-    match client
-        .post(url)
-        .bearer_auth(api_key)
-        .json(&request)
-        .send()
-        .await
-    {
-        Ok(response) => match response.error_for_status() {
-            Ok(response) => match response.json::<ChatCompletionResponse>().await {
-                Ok(body) => {
-                    let answer = body
-                        .choices
-                        .first()
-                        .map(|choice| choice.message.content.trim().to_string())
-                        .unwrap_or_default();
-                    BenchmarkResult {
-                        id: test.id.clone(),
-                        passed: grade(&answer, test),
-                        latency_ms: started.elapsed().as_millis() as u64,
-                        input_tokens: body.usage.as_ref().map_or(input_tokens, |u| u.prompt_tokens),
-                        output_tokens: body
-                            .usage
-                            .as_ref()
-                            .map_or_else(|| estimate_tokens(&answer), |u| u.completion_tokens),
-                        answer: Some(answer),
-                        error: None,
-                    }
-                }
-                Err(error) => error_result(test, started, input_tokens, error),
-            },
-            Err(error) => error_result(test, started, input_tokens, error),
-        },
-        Err(error) => error_result(test, started, input_tokens, error),
-    }
-}
-
-fn error_result<E: std::fmt::Display>(
-    test: &TestCase,
-    started: Instant,
-    input_tokens: u64,
-    error: E,
-) -> BenchmarkResult {
-    BenchmarkResult {
-        id: test.id.clone(),
-        passed: false,
-        latency_ms: started.elapsed().as_millis() as u64,
+    let url = format!(
+        "{}/chat/completions",
+        provider.base_url.trim_end_matches('/')
+    );
+    let response = send_with_retries::<ChatCompletionRequest, ChatCompletionResponse>(
+        client, run, api_key, &url, &request,
+    )
+    .await?;
+    let answer = response
+        .body
+        .choices
+        .first()
+        .map(|choice| choice.message.content.trim().to_string())
+        .unwrap_or_default();
+    let output_tokens = response
+        .body
+        .usage
+        .as_ref()
+        .map_or_else(|| estimate_tokens(&answer), |u| u.completion_tokens);
+    let input_tokens = response
+        .body
+        .usage
+        .as_ref()
+        .map_or(input_tokens, |u| u.prompt_tokens);
+    Ok(ProviderOutput {
+        answer,
         input_tokens,
-        output_tokens: 0,
-        answer: None,
-        error: Some(error.to_string()),
-    }
-}
-
-fn read_config(path: &Path) -> Result<Config> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("failed to read config {}", path.display()))?;
-    let mut in_provider = false;
-    let mut base_url = None;
-    let mut api_key_env = None;
-    let mut model = None;
-
-    for raw_line in text.lines() {
-        let line = raw_line.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with('[') && line.ends_with(']') {
-            in_provider = line == "[provider]";
-            continue;
-        }
-        if !in_provider {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let value = value.trim().trim_matches('"').to_string();
-        match key.trim() {
-            "base_url" => base_url = Some(value),
-            "api_key_env" => api_key_env = Some(value),
-            "model" => model = Some(value),
-            _ => {}
-        }
-    }
-
-    Ok(Config {
-        provider: ProviderConfig {
-            base_url: base_url.context("missing provider.base_url in config.toml")?,
-            api_key_env: api_key_env.context("missing provider.api_key_env in config.toml")?,
-            model: model.context("missing provider.model in config.toml")?,
-        },
+        output_tokens,
+        attempts: response.attempts,
+        http_status: response.http_status,
+        request_id: response.request_id,
+        rate_limit_remaining: response.rate_limit_remaining,
+        rate_limit_reset: response.rate_limit_reset,
     })
 }
 
-fn read_tests(bench_dir: &Path) -> Result<Vec<TestCase>> {
-    let mut tests = Vec::new();
-    for entry in WalkDir::new(bench_dir).min_depth(1).max_depth(1) {
+async fn send_responses(
+    client: &Client,
+    run: &RunConfig,
+    provider: &ProviderConfig,
+    api_key: &str,
+    prompt: &str,
+    input_tokens: u64,
+) -> std::result::Result<ProviderOutput, ProviderFailure> {
+    let request = ResponsesRequest {
+        model: provider.model.clone(),
+        input: prompt.to_string(),
+        temperature: Some(0.0),
+    };
+    let url = format!("{}/responses", provider.base_url.trim_end_matches('/'));
+    let response = send_with_retries::<ResponsesRequest, ResponsesResponse>(
+        client, run, api_key, &url, &request,
+    )
+    .await?;
+    let answer = responses_answer(&response.body);
+    let input_tokens = response
+        .body
+        .usage
+        .as_ref()
+        .and_then(|usage| usage.input_tokens)
+        .unwrap_or(input_tokens);
+    let output_tokens = response
+        .body
+        .usage
+        .as_ref()
+        .and_then(|usage| usage.output_tokens)
+        .unwrap_or_else(|| estimate_tokens(&answer));
+    Ok(ProviderOutput {
+        answer,
+        input_tokens,
+        output_tokens,
+        attempts: response.attempts,
+        http_status: response.http_status,
+        request_id: response.request_id,
+        rate_limit_remaining: response.rate_limit_remaining,
+        rate_limit_reset: response.rate_limit_reset,
+    })
+}
+
+async fn send_with_retries<Request, Response>(
+    client: &Client,
+    run: &RunConfig,
+    api_key: &str,
+    url: &str,
+    request: &Request,
+) -> std::result::Result<ProviderSuccess<Response>, ProviderFailure>
+where
+    Request: Serialize + ?Sized,
+    Response: DeserializeOwned,
+{
+    let max_attempts = run.max_retries.saturating_add(1).max(1);
+    let mut attempts = 0;
+
+    loop {
+        attempts += 1;
+        let response = client
+            .post(url)
+            .bearer_auth(api_key)
+            .timeout(Duration::from_secs(run.request_timeout_secs))
+            .json(request)
+            .send()
+            .await;
+
+        match response {
+            Ok(response) => {
+                let status = response.status();
+                let headers = response.headers();
+                let request_id = provider_request_id(headers);
+                let rate_limit_remaining = provider_rate_limit(headers, "x-ratelimit-remaining");
+                let rate_limit_reset = provider_rate_limit(headers, "x-ratelimit-reset");
+                if !status.is_success() {
+                    let body = response.text().await.unwrap_or_default();
+                    let error = anyhow!("HTTP {status} from provider: {}", body.trim());
+                    if is_retryable_status(status) && attempts < max_attempts {
+                        sleep(retry_delay(run, attempts)).await;
+                        continue;
+                    }
+                    return Err(ProviderFailure {
+                        error,
+                        attempts,
+                        kind: ErrorKind::Http,
+                        http_status: Some(status.as_u16()),
+                        request_id,
+                        rate_limit_remaining,
+                        rate_limit_reset,
+                    });
+                }
+
+                match response.json::<Response>().await {
+                    Ok(body) => {
+                        return Ok(ProviderSuccess {
+                            body,
+                            attempts,
+                            http_status: Some(status.as_u16()),
+                            request_id,
+                            rate_limit_remaining,
+                            rate_limit_reset,
+                        });
+                    }
+                    Err(error) => {
+                        return Err(ProviderFailure {
+                            error: anyhow!("failed to decode provider response: {error}"),
+                            attempts,
+                            kind: ErrorKind::ResponseDecode,
+                            http_status: Some(status.as_u16()),
+                            request_id,
+                            rate_limit_remaining,
+                            rate_limit_reset,
+                        });
+                    }
+                }
+            }
+            Err(error) => {
+                if is_retryable_error(&error) && attempts < max_attempts {
+                    sleep(retry_delay(run, attempts)).await;
+                    continue;
+                }
+                return Err(ProviderFailure {
+                    error: error.into(),
+                    attempts,
+                    kind: ErrorKind::Transport,
+                    http_status: None,
+                    request_id: None,
+                    rate_limit_remaining: None,
+                    rate_limit_reset: None,
+                });
+            }
+        }
+    }
+}
+
+fn provider_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    for key in ["x-request-id", "x-openai-request-id", "openai-request-id"] {
+        if let Some(value) = headers.get(key) {
+            if let Ok(value) = value.to_str() {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn provider_rate_limit(headers: &reqwest::header::HeaderMap, key: &str) -> Option<String> {
+    let candidates: &[&str] = match key {
+        "x-ratelimit-remaining" => &[
+            "x-ratelimit-remaining",
+            "x-ratelimit-remaining-requests",
+            "x-ratelimit-remaining-tokens",
+        ],
+        "x-ratelimit-reset" => &[
+            "x-ratelimit-reset",
+            "x-ratelimit-reset-requests",
+            "x-ratelimit-reset-tokens",
+        ],
+        other => &[other],
+    };
+
+    for candidate in candidates {
+        if let Some(value) = headers.get(*candidate) {
+            if let Ok(value) = value.to_str() {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn retry_delay(run: &RunConfig, attempts_so_far: u32) -> Duration {
+    let exponent = attempts_so_far.saturating_sub(1).min(10);
+    let multiplier = 1u64 << exponent;
+    Duration::from_millis(run.retry_backoff_ms.saturating_mul(multiplier))
+}
+
+fn is_retryable_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    ) || status.is_server_error()
+}
+
+fn is_retryable_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect()
+}
+
+struct ErrorResultInput<'a, E> {
+    test: &'a TestCase,
+    provider: &'a ProviderConfig,
+    started: Instant,
+    input_tokens: u64,
+    attempts: u32,
+    kind: ErrorKind,
+    http_status: Option<u16>,
+    request_id: Option<String>,
+    rate_limit_remaining: Option<String>,
+    rate_limit_reset: Option<String>,
+    error: E,
+}
+
+fn error_result<E: std::fmt::Display>(input: ErrorResultInput<'_, E>) -> BenchmarkResult {
+    BenchmarkResult {
+        schema_version: SCHEMA_VERSION,
+        suite: suite_name(input.test),
+        token_count: test_token_count(input.test),
+        id: input.test.id.clone(),
+        provider_model: Some(input.provider.model.clone()),
+        provider_base_url: Some(input.provider.base_url.clone()),
+        http_status: input.http_status,
+        request_id: input.request_id,
+        rate_limit_remaining: input.rate_limit_remaining,
+        rate_limit_reset: input.rate_limit_reset,
+        passed: false,
+        attempts: input.attempts,
+        latency_ms: input.started.elapsed().as_millis() as u64,
+        input_tokens: input.input_tokens,
+        output_tokens: 0,
+        answer: None,
+        error: Some(input.error.to_string()),
+        error_kind: Some(input.kind),
+    }
+}
+
+fn suite_name(test: &TestCase) -> Option<String> {
+    test.metadata.get("suite").cloned()
+}
+
+fn test_token_count(test: &TestCase) -> Option<u64> {
+    test.metadata
+        .get("token_count")
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+pub(crate) fn read_config(path: &Path) -> Result<Config> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read config {}", path.display()))?;
+    toml::from_str::<Config>(&text)
+        .with_context(|| format!("failed to parse config {}", path.display()))
+}
+
+pub(crate) fn read_tests(bench_dir: &Path) -> Result<Vec<TestCase>> {
+    let search_root = if bench_dir.join("manifests").is_dir() {
+        bench_dir.join("manifests")
+    } else {
+        bench_dir.to_path_buf()
+    };
+
+    let mut paths = Vec::new();
+    for entry in WalkDir::new(&search_root).min_depth(1) {
         let entry = entry?;
         let path = entry.path();
+        if !entry.file_type().is_file() {
+            continue;
+        }
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
             continue;
         }
         if path.file_name().and_then(|name| name.to_str()) == Some("results.json") {
             continue;
         }
-        let text = fs::read_to_string(path)
+        paths.push(path.to_path_buf());
+    }
+    paths.sort();
+
+    let mut tests = Vec::new();
+    for path in paths {
+        let text = fs::read_to_string(&path)
             .with_context(|| format!("failed to read test file {}", path.display()))?;
         if let Ok(manifest) = serde_json::from_str::<SuiteManifest>(&text) {
             tests.extend(manifest.suites);
@@ -200,15 +672,22 @@ fn read_tests(bench_dir: &Path) -> Result<Vec<TestCase>> {
 
 fn load_context(bench_dir: &Path, context: &str) -> Result<String> {
     let context_path = PathBuf::from(context);
-    if context_path.exists() {
+    if context_path.is_absolute() && context_path.exists() {
         return fs::read_to_string(&context_path)
             .with_context(|| format!("failed to read context {}", context_path.display()));
     }
-    let relative = bench_dir.join(context);
+
+    let relative = bench_dir.join(&context_path);
     if relative.exists() {
         return fs::read_to_string(&relative)
             .with_context(|| format!("failed to read context {}", relative.display()));
     }
+
+    if context_path.exists() {
+        return fs::read_to_string(&context_path)
+            .with_context(|| format!("failed to read context {}", context_path.display()));
+    }
+
     Ok(context.to_string())
 }
 
@@ -244,4 +723,394 @@ struct ChatChoice {
 struct ChatUsage {
     prompt_tokens: u64,
     completion_tokens: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesRequest {
+    model: String,
+    input: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesResponse {
+    #[serde(default)]
+    output_text: Option<String>,
+    #[serde(default)]
+    output: Vec<ResponsesOutputItem>,
+    #[serde(default)]
+    usage: Option<ResponsesUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesOutputItem {
+    #[serde(default)]
+    content: Vec<ResponsesContentItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesContentItem {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesUsage {
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
+}
+
+#[derive(Debug)]
+struct ProviderSuccess<T> {
+    body: T,
+    attempts: u32,
+    http_status: Option<u16>,
+    request_id: Option<String>,
+    rate_limit_remaining: Option<String>,
+    rate_limit_reset: Option<String>,
+}
+
+#[derive(Debug)]
+struct ProviderFailure {
+    error: anyhow::Error,
+    attempts: u32,
+    kind: ErrorKind,
+    http_status: Option<u16>,
+    request_id: Option<String>,
+    rate_limit_remaining: Option<String>,
+    rate_limit_reset: Option<String>,
+}
+
+#[derive(Debug)]
+struct ProviderOutput {
+    answer: String,
+    attempts: u32,
+    http_status: Option<u16>,
+    request_id: Option<String>,
+    rate_limit_remaining: Option<String>,
+    rate_limit_reset: Option<String>,
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
+fn responses_answer(response: &ResponsesResponse) -> String {
+    if let Some(output_text) = &response.output_text {
+        let trimmed = output_text.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    let mut chunks = Vec::new();
+    for item in &response.output {
+        for content in &item.content {
+            if content.kind.as_deref() == Some("output_text") {
+                if let Some(text) = &content.text {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        chunks.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+    chunks.join("\n")
+}
+
+#[derive(Debug, Serialize)]
+struct HttpExchangeLog {
+    schema_version: u32,
+    logged_at_unix_ms: u64,
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suite: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    http_status: Option<u16>,
+    attempts: u32,
+    latency_ms: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    passed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_kind: Option<ErrorKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_sha256: Option<String>,
+}
+
+fn build_prompt(context: &str, question: &str) -> String {
+    format!(
+        "Use the context to answer the question.\n\nContext:\n{context}\n\nQuestion:\n{question}\n\nAnswer:"
+    )
+}
+
+fn sha256_hex(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::benchmark::{Config, ProviderConfig, RunConfig, TestCase};
+    use std::collections::BTreeMap;
+    use tempfile::tempdir;
+
+    #[test]
+    fn config_uses_toml_parser_and_run_defaults() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[provider]
+base_url = "https://api.example.test/v1"
+api_key_env = "EXAMPLE_API_KEY"
+model = "example-model"
+"#,
+        )
+        .unwrap();
+
+        let config = read_config(&path).unwrap();
+        assert_eq!(config.schema_version, SCHEMA_VERSION);
+        assert_eq!(config.provider.model, "example-model");
+        assert_eq!(config.run.request_timeout_secs, 120);
+        assert_eq!(config.run.max_retries, 2);
+        assert_eq!(config.run.concurrency, 1);
+        assert!(!config.run.log_requests);
+        assert_eq!(config.run.request_log_path, "reports/http-log.jsonl");
+    }
+
+    #[test]
+    fn config_parses_response_request_style() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[provider]
+base_url = "https://api.example.test/v1"
+api_key_env = "EXAMPLE_API_KEY"
+model = "example-model"
+request_style = "responses"
+"#,
+        )
+        .unwrap();
+
+        let config = read_config(&path).unwrap();
+        assert_eq!(
+            config.provider.request_style,
+            crate::benchmark::ProviderRequestStyle::Responses
+        );
+    }
+
+    #[test]
+    fn read_tests_finds_new_manifest_layout() {
+        let tmp = tempdir().unwrap();
+        let manifests = tmp.path().join("manifests");
+        fs::create_dir_all(&manifests).unwrap();
+        fs::write(
+            manifests.join("needle.json"),
+            r#"
+{
+  "schema_version": 1,
+  "name": "needle",
+  "token_count": 100,
+  "seed": 7,
+  "suites": [{
+    "schema_version": 1,
+    "id": "needle-100",
+    "context": "contexts/needle_context.txt",
+    "question": "q",
+    "expected": ["a"],
+    "grader": "Exact",
+    "metadata": {}
+  }]
+}
+"#,
+        )
+        .unwrap();
+
+        let tests = read_tests(tmp.path()).unwrap();
+        assert_eq!(tests.len(), 1);
+        assert_eq!(tests[0].id, "needle-100");
+    }
+
+    #[test]
+    fn read_tests_finds_flat_layout_compatibility() {
+        let tmp = tempdir().unwrap();
+        fs::write(
+            tmp.path().join("needle.json"),
+            r#"
+{
+  "schema_version": 1,
+  "id": "flat-needle",
+  "context": "contexts/needle_context.txt",
+  "question": "q",
+  "expected": ["a"],
+  "grader": "Exact",
+  "metadata": {"suite": "needle", "token_count": "100000"}
+}
+"#,
+        )
+        .unwrap();
+
+        let tests = read_tests(tmp.path()).unwrap();
+        assert_eq!(tests.len(), 1);
+        assert_eq!(tests[0].id, "flat-needle");
+        assert_eq!(
+            tests[0].metadata.get("token_count"),
+            Some(&"100000".to_string())
+        );
+    }
+
+    #[test]
+    fn build_run_metadata_captures_snapshot() {
+        let bench_dir = tempdir().unwrap();
+        let results_path = bench_dir.path().join("results.jsonl");
+        let config = Config {
+            schema_version: SCHEMA_VERSION,
+            run: RunConfig {
+                request_timeout_secs: 30,
+                max_retries: 3,
+                retry_backoff_ms: 250,
+                concurrency: 4,
+                log_requests: true,
+                request_log_path: "reports/http-log.jsonl".to_string(),
+            },
+            provider: ProviderConfig {
+                base_url: "https://api.example.test/v1".to_string(),
+                api_key_env: "EXAMPLE_API_KEY".to_string(),
+                model: "example-model".to_string(),
+                request_style: crate::benchmark::ProviderRequestStyle::ChatCompletions,
+            },
+        };
+        let mut metadata = BTreeMap::new();
+        metadata.insert("suite".to_string(), "needle".to_string());
+        let tests = vec![TestCase {
+            schema_version: SCHEMA_VERSION,
+            id: "needle-100".to_string(),
+            context: "contexts/needle_context.txt".to_string(),
+            question: "q".to_string(),
+            expected: vec!["a".to_string()],
+            grader: crate::benchmark::Grader::Exact,
+            metadata,
+        }];
+
+        let snapshot = build_run_metadata(bench_dir.path(), &results_path, 1234, &config, &tests);
+        assert_eq!(snapshot.schema_version, SCHEMA_VERSION);
+        assert_eq!(snapshot.test_count, 1);
+        assert_eq!(snapshot.provider_model, "example-model");
+        assert_eq!(snapshot.provider_request_style, "chat-completions");
+        assert_eq!(snapshot.concurrency, 4);
+        assert!(snapshot.log_requests);
+        assert_eq!(
+            snapshot.request_log_path,
+            Some("reports/http-log.jsonl".to_string())
+        );
+        assert_eq!(snapshot.suites, vec!["needle"]);
+        assert_eq!(snapshot.finished_at_unix_ms, None);
+    }
+
+    #[test]
+    fn provider_headers_capture_request_and_rate_limit_metadata() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-request-id", "req_123".parse().unwrap());
+        headers.insert("x-ratelimit-remaining", "42".parse().unwrap());
+        headers.insert("x-ratelimit-reset", "1s".parse().unwrap());
+
+        assert_eq!(provider_request_id(&headers), Some("req_123".to_string()));
+        assert_eq!(
+            provider_rate_limit(&headers, "x-ratelimit-remaining"),
+            Some("42".to_string())
+        );
+        assert_eq!(
+            provider_rate_limit(&headers, "x-ratelimit-reset"),
+            Some("1s".to_string())
+        );
+    }
+
+    #[test]
+    fn responses_answer_prefers_output_text_and_falls_back_to_output_items() {
+        let direct = ResponsesResponse {
+            output_text: Some(" direct answer ".to_string()),
+            output: Vec::new(),
+            usage: None,
+        };
+        assert_eq!(responses_answer(&direct), "direct answer");
+
+        let fallback = ResponsesResponse {
+            output_text: None,
+            output: vec![ResponsesOutputItem {
+                content: vec![ResponsesContentItem {
+                    kind: Some("output_text".to_string()),
+                    text: Some(" fallback answer ".to_string()),
+                }],
+            }],
+            usage: None,
+        };
+        assert_eq!(responses_answer(&fallback), "fallback answer");
+    }
+
+    #[test]
+    fn request_logs_are_redacted_and_include_request_ids() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("contexts")).unwrap();
+        fs::write(
+            tmp.path().join("contexts/needle_context.txt"),
+            "secret code orchid-123",
+        )
+        .unwrap();
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert("suite".to_string(), "needle".to_string());
+        metadata.insert("token_count".to_string(), "100000".to_string());
+        let test = TestCase {
+            schema_version: SCHEMA_VERSION,
+            id: "needle-100000".to_string(),
+            context: "contexts/needle_context.txt".to_string(),
+            question: "What is the archive access code?".to_string(),
+            expected: vec!["orchid-123".to_string()],
+            grader: crate::benchmark::Grader::Exact,
+            metadata,
+        };
+        let result = BenchmarkResult {
+            schema_version: SCHEMA_VERSION,
+            suite: Some("needle".to_string()),
+            token_count: Some(100000),
+            id: "needle-100000".to_string(),
+            provider_model: Some("example-model".to_string()),
+            provider_base_url: Some("https://api.example.test/v1".to_string()),
+            http_status: Some(200),
+            request_id: Some("req-abc".to_string()),
+            rate_limit_remaining: None,
+            rate_limit_reset: None,
+            passed: true,
+            attempts: 1,
+            latency_ms: 9,
+            input_tokens: 12,
+            output_tokens: 4,
+            answer: Some("orchid-123".to_string()),
+            error: None,
+            error_kind: None,
+        };
+        let log_path = tmp.path().join("reports/http-log.jsonl");
+
+        write_request_logs(tmp.path(), &log_path, &[test], &[result]).unwrap();
+        let log = fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("req-abc"));
+        assert!(log.contains("request_sha256"));
+        assert!(log.contains("response_sha256"));
+        assert!(!log.contains("archive access code"));
+        assert!(!log.contains("orchid-123"));
+    }
 }
