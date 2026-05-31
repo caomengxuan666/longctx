@@ -21,4 +21,5 @@ Known compatible layouts:
 - Benchmark manifests under `manifests/*.json`.
 - Older flat manifests at the benchmark root.
 - Result rows in `results.jsonl` with optional newer fields.
+- Nested routing audit objects in result rows, as long as their `schema_version` is supported.
 - Run snapshots in `run.json` with optional newer fields.

@@ -195,6 +195,16 @@ fn read_results(results_path: &str) -> Result<Vec<BenchmarkResult>> {
                 SCHEMA_VERSION
             );
         }
+        if let Some(routing) = &result.routing {
+            if routing.schema_version > SCHEMA_VERSION {
+                anyhow::bail!(
+                    "routing schema_version {} on line {} is newer than supported schema_version {}",
+                    routing.schema_version,
+                    idx + 1,
+                    SCHEMA_VERSION
+                );
+            }
+        }
         results.push(result);
     }
     Ok(results)
@@ -513,6 +523,21 @@ mod tests {
 
         let error = generate_summary(results.to_str().unwrap()).unwrap_err();
         assert!(error.to_string().contains("newer than supported"));
+    }
+
+    #[test]
+    fn report_rejects_newer_routing_schema_version() {
+        let tmp = tempdir().unwrap();
+        let results = tmp.path().join("results.jsonl");
+        fs::write(
+            &results,
+            r#"{"schema_version":1,"id":"a","passed":true,"latency_ms":1,"input_tokens":1,"output_tokens":1,"answer":"A","error":null,"routing":{"schema_version":999,"test_id":"a","selected_context_id":"ctx","selected_context_path":"contexts/a.txt","method":"hybrid","status":"selected","confidence":1.0,"candidates":[],"llm_router_used":false,"input_tokens":0,"output_tokens":0,"latency_ms":0}}
+"#,
+        )
+        .unwrap();
+
+        let error = generate_summary(results.to_str().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("routing schema_version 999"));
     }
 
     #[test]
