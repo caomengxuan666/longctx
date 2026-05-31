@@ -34,6 +34,22 @@ The next work should make the loop dependable enough for repeat use.
 - CI checks for formatting, linting, unit tests, builds, and doc drift.
 - Machine-readable report summary exports.
 - Provider-specific adapters for chat completions and responses APIs.
+- Zero-token automatic context routing with a reproducible `context.index.json`.
+- Per-result routing audit metadata and report columns for routed runs.
+- Run preflight validation, duplicate test ID rejection, and output overwrite protection for results, run snapshots, and request logs.
+- Runtime context index validation for stale hashes and path escape attempts.
+- Result reader guards for unsupported future schema versions and duplicate comparison IDs.
+- Structured LLM judge failure reporting with judge status, attempts, token, latency, and error metadata.
+- LLM judge retry/backoff behavior aligned with benchmark provider requests.
+- LLM judge support for both chat-completions and responses provider request styles.
+- Dry-run, filter, and limit controls for targeted benchmark execution.
+- Durable result writes that flush each completed row during long runs.
+- Token-suffixed generated manifests and contexts so token sweeps do not overwrite earlier suites.
+- Run snapshot artifact fingerprints for manifests, contexts, and `context.index.json`.
+- Default report output under `reports/report.html` next to the results file.
+- CI coverage for Linux stable, MSRV 1.86, and platform tests for macOS and Windows.
+- Tag-based release automation with test gates, target-named archives, SHA256 checksums, and GitHub Release assets.
+- MIT license metadata and root `LICENSE` file for crate publication.
 
 ## Next priorities
 

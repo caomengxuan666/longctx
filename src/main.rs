@@ -27,6 +27,18 @@ enum Commands {
     Run {
         /// Benchmark directory containing config.toml and test cases
         bench_dir: String,
+        /// Overwrite existing results and request log files
+        #[arg(long)]
+        force: bool,
+        /// Validate config, select tests, and resolve auto routing without sending provider requests
+        #[arg(long)]
+        dry_run: bool,
+        /// Run only tests whose ID or suite contains this text
+        #[arg(long)]
+        filter: Option<String>,
+        /// Run at most this many selected tests
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Generate HTML report from results
     Report {
@@ -63,6 +75,11 @@ enum Commands {
         #[arg(long)]
         skip_api_key_check: bool,
     },
+    /// Build or refresh the context index used by auto routing
+    Index {
+        /// Benchmark directory containing manifests and contexts
+        bench_dir: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -76,9 +93,36 @@ fn main() -> anyhow::Result<()> {
         } => {
             longctx::generator::generate(&suite, tokens, seed, &out)?;
         }
-        Commands::Run { bench_dir } => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(longctx::runner::run_benchmarks(&bench_dir))?;
+        Commands::Run {
+            bench_dir,
+            force,
+            dry_run,
+            filter,
+            limit,
+        } => {
+            let options = longctx::runner::RunOptions {
+                force,
+                dry_run,
+                filter,
+                limit,
+            };
+            if dry_run {
+                let summary = longctx::runner::dry_run_benchmarks(&bench_dir, options)?;
+                println!(
+                    "dry run ok: selected {}/{} tests for model {}",
+                    summary.selected_count, summary.total_count, summary.provider_model
+                );
+                println!(
+                    "auto contexts: {}/{} routed",
+                    summary.routed_auto_context_count, summary.auto_context_count
+                );
+                println!("suites: {}", summary.suites.join(", "));
+            } else {
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(longctx::runner::run_benchmarks_with_options(
+                    &bench_dir, options,
+                ))?;
+            }
         }
         Commands::Report { results, out, json } => {
             if json {
@@ -90,7 +134,7 @@ fn main() -> anyhow::Result<()> {
                     println!("{json_summary}");
                 }
             } else {
-                let out = out.unwrap_or_else(|| "report.html".to_string());
+                let out = out.unwrap_or_else(|| default_report_output(&results));
                 longctx::report::generate_html(&results, &out)?;
             }
         }
@@ -129,6 +173,23 @@ fn main() -> anyhow::Result<()> {
                 summary.test_count, summary.config_model
             );
         }
+        Commands::Index { bench_dir } => {
+            let bench_path = std::path::Path::new(&bench_dir);
+            let index = longctx::context_index::build_context_index(bench_path)?;
+            longctx::context_index::write_context_index(bench_path, &index)?;
+            println!("indexed {} contexts", index.contexts.len());
+        }
     }
     Ok(())
+}
+
+fn default_report_output(results: &str) -> String {
+    let results_path = std::path::Path::new(results);
+    results_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("reports")
+        .join("report.html")
+        .to_string_lossy()
+        .into_owned()
 }

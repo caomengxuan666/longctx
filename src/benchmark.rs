@@ -31,10 +31,45 @@ pub enum Grader {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ErrorKind {
     ContextLoad,
+    ContextRoute,
     Transport,
     Http,
     ResponseDecode,
+    Judge,
     Validation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RoutingCandidate {
+    pub context_id: String,
+    pub path: String,
+    pub score: f64,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RoutingDecision {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    pub test_id: String,
+    pub selected_context_id: Option<String>,
+    pub selected_context_path: Option<String>,
+    pub method: String,
+    pub status: String,
+    pub confidence: f64,
+    #[serde(default)]
+    pub candidates: Vec<RoutingCandidate>,
+    #[serde(default)]
+    pub llm_router_used: bool,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub latency_ms: u64,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,9 +104,19 @@ pub struct BenchmarkResult {
     #[serde(default)]
     pub error_kind: Option<ErrorKind>,
     #[serde(default)]
+    pub routing: Option<RoutingDecision>,
+    #[serde(default)]
     pub judge_latency_ms: Option<u64>,
     #[serde(default)]
     pub judge_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub judge_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub judge_http_status: Option<u16>,
+    #[serde(default)]
+    pub judge_attempts: Option<u32>,
+    #[serde(default)]
+    pub judge_error: Option<String>,
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
 }
@@ -118,6 +163,15 @@ pub struct RunMetadata {
     pub request_log_path: Option<String>,
     #[serde(default)]
     pub suites: Vec<String>,
+    #[serde(default)]
+    pub artifact_fingerprints: Vec<ArtifactFingerprint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactFingerprint {
+    pub path: String,
+    pub sha256: String,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,8 +297,13 @@ mod tests {
             answer: Some("ORCHID-123".to_string()),
             error: None,
             error_kind: None,
+            routing: None,
             judge_latency_ms: None,
             judge_input_tokens: None,
+            judge_output_tokens: None,
+            judge_http_status: None,
+            judge_attempts: None,
+            judge_error: None,
             metadata: BTreeMap::new(),
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -301,9 +360,11 @@ mod tests {
     fn error_kind_serde_round_trip() {
         let kinds = vec![
             ErrorKind::ContextLoad,
+            ErrorKind::ContextRoute,
             ErrorKind::Transport,
             ErrorKind::Http,
             ErrorKind::ResponseDecode,
+            ErrorKind::Judge,
             ErrorKind::Validation,
         ];
         for kind in &kinds {
@@ -341,5 +402,25 @@ mod tests {
     fn grader_config_default_has_no_judge_model() {
         let config = GraderConfig::default();
         assert!(config.judge_model.is_none());
+    }
+
+    #[test]
+    fn older_run_metadata_defaults_artifact_fingerprints() {
+        let json = r#"{
+            "schema_version": 1,
+            "bench_dir": "bench",
+            "results_path": "bench/results.jsonl",
+            "started_at_unix_ms": 1,
+            "test_count": 1,
+            "provider_model": "model",
+            "provider_base_url": "https://api.example.test/v1",
+            "provider_request_style": "chat-completions",
+            "request_timeout_secs": 120,
+            "max_retries": 2,
+            "retry_backoff_ms": 500,
+            "concurrency": 1
+        }"#;
+        let metadata: RunMetadata = serde_json::from_str(json).unwrap();
+        assert!(metadata.artifact_fingerprints.is_empty());
     }
 }

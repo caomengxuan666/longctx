@@ -8,8 +8,16 @@ Design and configuration notes live in [docs/configuration.md](docs/configuratio
 
 ## Install
 
+Minimum supported Rust version: 1.86.
+
 ```sh
 cargo install --git https://github.com/LibSkills/longctx.git
+```
+
+Tagged releases publish platform archives for Linux, macOS, and Windows with SHA256 checksum files. After a crates.io release exists, install with:
+
+```sh
+cargo install longctx
 ```
 
 ## Commands
@@ -46,9 +54,14 @@ Run generated benchmark cases against an OpenAI-compatible provider. The benchma
 
 ```sh
 longctx run ./bench
+longctx run ./bench --force
+longctx run ./bench --dry-run
+longctx run ./bench --filter needle --limit 2
 ```
 
 Results are written to `./bench/results.jsonl`.
+By default, `run` refuses to overwrite an existing `results.jsonl`, `run.json`, or request log. Use `--force` when intentionally replacing prior output.
+Use `--dry-run` to validate config, select tests, and resolve `context = "auto"` without reading the API key, sending provider requests, or writing results. Use `--filter <text>` to select tests whose ID or suite contains the text, and `--limit <n>` to cap the selected set.
 
 ### `validate`
 
@@ -60,17 +73,30 @@ longctx validate ./bench
 
 Use `--skip-api-key-check` when you only want to check files and schema.
 
+### `index`
+
+Build or refresh the context index used by automatic context routing.
+
+```sh
+longctx index ./bench
+```
+
+Generated suites write this index automatically with deterministic metadata for reproducible benchmark data. Run `index` after hand-editing manifests or context files.
+
 ### `report`
 
 Generate a standalone HTML report from a results JSONL file.
 
 ```sh
+longctx report ./bench/results.jsonl
 longctx report ./bench/results.jsonl --out report.html
 longctx report ./bench/results.jsonl --json
 longctx report ./bench/results.jsonl --json --out report.json
 ```
 
 The report includes per-suite summaries, per-token-count summaries, trend charts, and failure groups.
+Without `--out`, HTML reports are written next to the results file under `reports/report.html`.
+When result rows include automatic routing decisions, the report shows the selected context, routing method, status, and confidence.
 `--json` emits a machine-readable summary.
 
 ### `compare`
@@ -120,7 +146,7 @@ longctx run ./bench
 Generate the report:
 
 ```sh
-longctx report ./bench/results.jsonl --out report.html
+longctx report ./bench/results.jsonl
 ```
 
 ## Config File Format
@@ -136,7 +162,7 @@ model = "gpt-4.1"
 
 Fields:
 
-- `base_url`: Provider base URL. The runner posts to `{base_url}/chat/completions`.
+- `base_url`: Provider base URL. It must be an absolute `http` or `https` URL with no query string or fragment. The runner posts to `{base_url}/chat/completions` or `{base_url}/responses`.
 - `api_key_env`: Name of the environment variable containing the API key.
 - `model`: Model name sent in the chat completion request.
 - `request_timeout_secs`: Per-request timeout in seconds.
@@ -145,7 +171,7 @@ Fields:
 - `concurrency`: Number of benchmark requests to run in parallel.
 - `request_style`: Provider request style, either `chat-completions` or `responses`.
 - `log_requests`: Write opt-in redacted HTTP exchange logs under `reports/`.
-- `request_log_path`: Path for the request log file, defaulting to `reports/http-log.jsonl`.
+- `request_log_path`: Relative path under `reports/` for the request log file, defaulting to `reports/http-log.jsonl`.
 
 The config also supports an optional `[grader]` section for LLM-as-judge grading:
 
@@ -154,7 +180,7 @@ The config also supports an optional `[grader]` section for LLM-as-judge grading
 judge_model = "gpt-4.1-mini"  # optional, defaults to the same provider model
 ```
 
-When a test case uses `Grader::LlmJudge`, the runner sends the answer to the judge model for evaluation instead of using exact string matching.
+When a test case uses `Grader::LlmJudge`, the runner sends the answer to the judge model for evaluation instead of using exact string matching. Judge requests use the configured provider request style plus the same retry, backoff, and timeout controls as benchmark provider requests. Judge failures are reported separately with `error_kind = "Judge"` and include judge HTTP status, attempts, latency, token counts, and error text in the result row.
 
 Any provider that exposes an OpenAI-compatible `/chat/completions` endpoint can be used by changing `base_url`, `api_key_env`, and `model`.
 
@@ -162,13 +188,25 @@ Any provider that exposes an OpenAI-compatible `/chat/completions` endpoint can 
 
 Each generated suite writes:
 
-- A context text file under `contexts/`.
-- A suite manifest JSON file under `manifests/`.
+- Context text files under `contexts/`, with token-suffixed names so token sweeps do not overwrite earlier contexts.
+- Suite manifest JSON files under `manifests/`, with token-suffixed names so token sweeps can share one benchmark directory.
+- A context routing index at `context.index.json`.
 
 The runner accepts generated suite manifests and writes newline-delimited JSON results to `results.jsonl`.
-Result rows include the suite name, token count, provider model, HTTP status, provider request ID, rate-limit headers, attempt count, and structured error kind when a run fails.
-Each run also writes a `run.json` snapshot with config and timing metadata.
+Result rows include the suite name, token count, provider model, HTTP status, provider request ID, rate-limit headers, attempt count, structured error kind when a run fails, optional judge audit details, and optional routing audit details. Readers reject result rows with a newer unsupported `schema_version`, and `compare` rejects duplicate result IDs.
+Each run also writes a `run.json` snapshot with config, timing metadata, and SHA256 fingerprints for benchmark manifests, contexts, and `context.index.json`.
 When `run.log_requests` is enabled, redacted HTTP exchange logs are written to `reports/http-log.jsonl`.
+Reports default to `reports/report.html` next to the results file unless `--out` is provided.
+Direct context file paths in manifests must resolve under the benchmark directory. Absolute paths and `..` paths that escape the benchmark directory are rejected before provider requests are sent.
+
+## Automatic Context Routing
+
+Set a test case's `context = "auto"` to let the runner select a context file from `context.index.json` instead of naming a file directly.
+
+The first implementation is a zero-token local router. It scores context-level index entries using safe manifest metadata, test IDs, suite names, token counts, and lexical overlap with the question. It does not call an LLM router and does not inspect `expected` answers. If routing is ambiguous or top candidates tie, the result fails with `error_kind = "ContextRoute"` instead of silently choosing a weak candidate.
+
+Routing decisions are written into each result row under `routing`, including selected context path, candidate scores, method, status, confidence, token usage, and latency fields. The token and latency fields are currently zero because the local router does not spend model tokens.
+Existing `context.index.json` files are validated during `run`; stale hashes, unsupported schema versions, absolute paths, and paths escaping the benchmark directory are rejected before provider requests are sent.
 
 ## Contributing
 
@@ -187,3 +225,7 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo build
 ```
+
+## License
+
+LongContextBench is licensed under the MIT License. See [LICENSE](LICENSE).

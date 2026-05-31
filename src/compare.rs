@@ -1,4 +1,4 @@
-use crate::benchmark::BenchmarkResult;
+use crate::benchmark::{BenchmarkResult, SCHEMA_VERSION};
 use anyhow::{Context, Result};
 use askama::Template;
 use serde::Serialize;
@@ -154,7 +154,28 @@ fn read_results(path: &str) -> Result<BTreeMap<String, BenchmarkResult>> {
         }
         let result = serde_json::from_str::<BenchmarkResult>(line)
             .with_context(|| format!("failed to parse JSONL line {}", idx + 1))?;
-        results.insert(result.id.clone(), result);
+        if result.schema_version > SCHEMA_VERSION {
+            anyhow::bail!(
+                "results file schema_version {} on line {} is newer than supported schema_version {}",
+                result.schema_version,
+                idx + 1,
+                SCHEMA_VERSION
+            );
+        }
+        if let Some(routing) = &result.routing {
+            if routing.schema_version > SCHEMA_VERSION {
+                anyhow::bail!(
+                    "routing schema_version {} on line {} is newer than supported schema_version {}",
+                    routing.schema_version,
+                    idx + 1,
+                    SCHEMA_VERSION
+                );
+            }
+        }
+        let id = result.id.clone();
+        if results.insert(id.clone(), result).is_some() {
+            anyhow::bail!("duplicate result id on line {}: {}", idx + 1, id);
+        }
     }
     Ok(results)
 }
@@ -309,6 +330,59 @@ mod tests {
         assert!(summary.regressed_ids.is_empty());
         assert_eq!(summary.added_ids, vec!["b"]);
         assert_eq!(summary.removed_ids, vec!["a"]);
+    }
+
+    #[test]
+    fn compare_rejects_duplicate_result_ids() {
+        let tmp = tempdir().unwrap();
+        let baseline = tmp.path().join("baseline.jsonl");
+        let candidate = tmp.path().join("candidate.jsonl");
+        fs::write(
+            &baseline,
+            format!("{}\n{}\n", result_line("a", true), result_line("a", false)),
+        )
+        .unwrap();
+        fs::write(&candidate, format!("{}\n", result_line("a", true))).unwrap();
+
+        let error =
+            compare_results(baseline.to_str().unwrap(), candidate.to_str().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("duplicate result id"));
+    }
+
+    #[test]
+    fn compare_rejects_newer_result_schema_version() {
+        let tmp = tempdir().unwrap();
+        let baseline = tmp.path().join("baseline.jsonl");
+        let candidate = tmp.path().join("candidate.jsonl");
+        fs::write(
+            &baseline,
+            r#"{"schema_version":999,"id":"a","passed":true,"latency_ms":1,"input_tokens":1,"output_tokens":1,"answer":"A","error":null}
+"#,
+        )
+        .unwrap();
+        fs::write(&candidate, format!("{}\n", result_line("a", true))).unwrap();
+
+        let error =
+            compare_results(baseline.to_str().unwrap(), candidate.to_str().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("newer than supported"));
+    }
+
+    #[test]
+    fn compare_rejects_newer_routing_schema_version() {
+        let tmp = tempdir().unwrap();
+        let baseline = tmp.path().join("baseline.jsonl");
+        let candidate = tmp.path().join("candidate.jsonl");
+        fs::write(
+            &baseline,
+            r#"{"schema_version":1,"id":"a","passed":true,"latency_ms":1,"input_tokens":1,"output_tokens":1,"answer":"A","error":null,"routing":{"schema_version":999,"test_id":"a","selected_context_id":"ctx","selected_context_path":"contexts/a.txt","method":"hybrid","status":"selected","confidence":1.0,"candidates":[],"llm_router_used":false,"input_tokens":0,"output_tokens":0,"latency_ms":0}}
+"#,
+        )
+        .unwrap();
+        fs::write(&candidate, format!("{}\n", result_line("a", true))).unwrap();
+
+        let error =
+            compare_results(baseline.to_str().unwrap(), candidate.to_str().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("routing schema_version 999"));
     }
 
     #[test]

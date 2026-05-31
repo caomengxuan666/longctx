@@ -1,4 +1,5 @@
 use crate::benchmark::{Grader, SuiteManifest, TestCase, SCHEMA_VERSION};
+use crate::context_index::{build_reproducible_context_index, write_context_index};
 use crate::tokenizer::TokenCounter;
 use anyhow::{bail, Context, Result};
 use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
@@ -12,6 +13,11 @@ pub fn generate(
     seed: Option<u64>,
     out_dir: &str,
 ) -> Result<()> {
+    let suite_type = normalize_suite_type(suite_type)?;
+    if token_count == 0 {
+        bail!("token count must be greater than 0");
+    }
+
     let out_dir = Path::new(out_dir);
     let manifests_dir = out_dir.join("manifests");
     let contexts_dir = out_dir.join("contexts");
@@ -28,38 +34,58 @@ pub fn generate(
         )
     })?;
 
-    let suite_type = suite_type.to_ascii_lowercase();
     let seed = seed.unwrap_or_else(|| rand::thread_rng().gen());
     let mut rng = StdRng::seed_from_u64(seed);
     let counter = TokenCounter::cl100k();
-    let manifest = match suite_type.as_str() {
-        "needle" | "needlesuite" => build_needle_suite(&mut rng, token_count, seed, &contexts_dir, &counter)?,
-        "multi-needle" | "multineedle" | "multi_needle" | "multineedlesuite" => {
+    let manifest = match suite_type {
+        "needle" => build_needle_suite(&mut rng, token_count, seed, &contexts_dir, &counter)?,
+        "multi-needle" => {
             build_multi_needle_suite(&mut rng, token_count, seed, &contexts_dir, &counter)?
         }
-        "conflict" | "conflictsuite" => {
-            build_conflict_suite(&mut rng, token_count, seed, &contexts_dir, &counter)?
-        }
-        "multi-hop" | "multihop" | "multi_hop" => {
-            build_multi_hop_suite(&mut rng, token_count, seed, &contexts_dir, &counter)?
-        }
-        "order-dependent" | "orderdependent" | "order_dependent" => {
+        "conflict" => build_conflict_suite(&mut rng, token_count, seed, &contexts_dir, &counter)?,
+        "multi-hop" => build_multi_hop_suite(&mut rng, token_count, seed, &contexts_dir, &counter)?,
+        "order-dependent" => {
             build_order_dependent_suite(&mut rng, token_count, seed, &contexts_dir, &counter)?
         }
-        "position-sweep" | "positionsweep" | "position_sweep" => {
+        "position-sweep" => {
             build_position_sweep_suite(&mut rng, token_count, seed, &contexts_dir, &counter)?
         }
-        "hallucination" | "hallucinationsuite" => {
+        "hallucination" => {
             build_hallucination_suite(&mut rng, token_count, seed, &contexts_dir, &counter)?
         }
-        other => bail!("unknown suite type '{other}', expected needle, multi-needle, conflict, multi-hop, order-dependent, position-sweep, or hallucination"),
+        _ => unreachable!("suite type is normalized before generation"),
     };
 
-    let manifest_path = manifests_dir.join(format!("{}.json", manifest.name));
+    let manifest_path = manifests_dir.join(manifest_file_name(&manifest));
     let json = serde_json::to_string_pretty(&manifest)?;
     fs::write(&manifest_path, json)
         .with_context(|| format!("failed to write manifest {}", manifest_path.display()))?;
+    let index = build_reproducible_context_index(out_dir)?;
+    write_context_index(out_dir, &index)?;
     Ok(())
+}
+
+fn normalize_suite_type(suite_type: &str) -> Result<&'static str> {
+    match suite_type.to_ascii_lowercase().as_str() {
+        "needle" | "needlesuite" => Ok("needle"),
+        "multi-needle" | "multineedle" | "multi_needle" | "multineedlesuite" => {
+            Ok("multi-needle")
+        }
+        "conflict" | "conflictsuite" => Ok("conflict"),
+        "multi-hop" | "multihop" | "multi_hop" => Ok("multi-hop"),
+        "order-dependent" | "orderdependent" | "order_dependent" => Ok("order-dependent"),
+        "position-sweep" | "positionsweep" | "position_sweep" => Ok("position-sweep"),
+        "hallucination" | "hallucinationsuite" => Ok("hallucination"),
+        other => bail!("unknown suite type '{other}', expected needle, multi-needle, conflict, multi-hop, order-dependent, position-sweep, or hallucination"),
+    }
+}
+
+fn manifest_file_name(manifest: &SuiteManifest) -> String {
+    format!("{}-{}.json", manifest.name, manifest.token_count)
+}
+
+fn context_file_name(stem: &str, token_count: u64) -> String {
+    format!("{stem}-{token_count}.txt")
 }
 
 fn build_needle_suite(
@@ -74,7 +100,7 @@ fn build_needle_suite(
     let context_path = write_context(
         rng,
         contexts_dir,
-        "needle_context.txt",
+        &context_file_name("needle_context", token_count),
         token_count,
         &[needle],
         counter,
@@ -128,7 +154,7 @@ fn build_multi_needle_suite(
     let context_path = write_context(
         rng,
         contexts_dir,
-        "multi_needle_context.txt",
+        &context_file_name("multi_needle_context", token_count),
         token_count,
         &facts,
         counter,
@@ -178,7 +204,7 @@ fn build_conflict_suite(
     let context_path = write_context(
         rng,
         contexts_dir,
-        "conflict_context.txt",
+        &context_file_name("conflict_context", token_count),
         token_count,
         &facts,
         counter,
@@ -237,7 +263,7 @@ fn build_multi_hop_suite(
     let context_path = write_context(
         rng,
         contexts_dir,
-        "multi_hop_context.txt",
+        &context_file_name("multi_hop_context", token_count),
         token_count,
         &facts,
         counter,
@@ -299,7 +325,7 @@ fn build_order_dependent_suite(
     let context_path = write_context(
         rng,
         contexts_dir,
-        "order_dependent_context.txt",
+        &context_file_name("order_dependent_context", token_count),
         token_count,
         &facts,
         counter,
@@ -351,7 +377,7 @@ fn build_position_sweep_suite(
     for (label, pos) in &positions {
         let secret = format!("ORCHID-{}", rng.gen_range(100_000..999_999));
         let needle = format!("Needle fact: the archive access code is {secret}.");
-        let file_name = format!("position_sweep_{label}.txt");
+        let file_name = context_file_name(&format!("position_sweep_{label}"), token_count);
         let context_path = write_context(
             rng,
             contexts_dir,
@@ -413,7 +439,7 @@ fn build_hallucination_suite(
 
     let mut test_cases = Vec::with_capacity(questions.len());
     for (label, question) in &questions {
-        let file_name = format!("hallucination_{label}.txt");
+        let file_name = context_file_name(&format!("hallucination_{label}"), token_count);
         let context_path = write_context(
             rng,
             contexts_dir,
@@ -519,8 +545,12 @@ mod tests {
         generate("needle", 100, Some(42), tmp_a.path().to_str().unwrap()).unwrap();
         generate("needle", 100, Some(42), tmp_b.path().to_str().unwrap()).unwrap();
 
-        let manifest_a = fs::read_to_string(tmp_a.path().join("manifests/needle.json")).unwrap();
-        let manifest_b = fs::read_to_string(tmp_b.path().join("manifests/needle.json")).unwrap();
+        let manifest_a =
+            fs::read_to_string(tmp_a.path().join("manifests/needle-100.json")).unwrap();
+        let manifest_b =
+            fs::read_to_string(tmp_b.path().join("manifests/needle-100.json")).unwrap();
+        let index_a = fs::read_to_string(tmp_a.path().join("context.index.json")).unwrap();
+        let index_b = fs::read_to_string(tmp_b.path().join("context.index.json")).unwrap();
 
         let parsed_a: SuiteManifest = serde_json::from_str(&manifest_a).unwrap();
         let parsed_b: SuiteManifest = serde_json::from_str(&manifest_b).unwrap();
@@ -528,6 +558,39 @@ mod tests {
         assert_eq!(parsed_a.name, parsed_b.name);
         assert_eq!(parsed_a.suites[0].expected, parsed_b.suites[0].expected);
         assert_eq!(manifest_a, manifest_b);
+        assert_eq!(index_a, index_b);
+        assert!(index_a.contains("\"created_at_unix_ms\": 0"));
+    }
+
+    #[test]
+    fn generation_preserves_multiple_token_counts_in_one_output_dir() {
+        let tmp = tempdir().unwrap();
+
+        generate("needle", 100, Some(42), tmp.path().to_str().unwrap()).unwrap();
+        generate("needle", 200, Some(43), tmp.path().to_str().unwrap()).unwrap();
+
+        assert!(tmp.path().join("manifests/needle-100.json").exists());
+        assert!(tmp.path().join("manifests/needle-200.json").exists());
+        assert!(tmp.path().join("contexts/needle_context-100.txt").exists());
+        assert!(tmp.path().join("contexts/needle_context-200.txt").exists());
+
+        let tests = crate::runner::read_tests(tmp.path()).unwrap();
+        assert_eq!(tests.len(), 2);
+        assert!(tests.iter().any(|test| test.id == "needle-100"));
+        assert!(tests.iter().any(|test| test.id == "needle-200"));
+
+        let index =
+            crate::context_index::read_context_index(&tmp.path().join("context.index.json"))
+                .unwrap();
+        assert_eq!(index.contexts.len(), 2);
+        assert!(index
+            .contexts
+            .iter()
+            .any(|context| context.path == "contexts/needle_context-100.txt"));
+        assert!(index
+            .contexts
+            .iter()
+            .any(|context| context.path == "contexts/needle_context-200.txt"));
     }
 
     #[test]
@@ -551,9 +614,9 @@ mod tests {
         .unwrap();
 
         let manifest_a =
-            fs::read_to_string(tmp_a.path().join("manifests/multi_needle.json")).unwrap();
+            fs::read_to_string(tmp_a.path().join("manifests/multi_needle-100.json")).unwrap();
         let manifest_b =
-            fs::read_to_string(tmp_b.path().join("manifests/multi_needle.json")).unwrap();
+            fs::read_to_string(tmp_b.path().join("manifests/multi_needle-100.json")).unwrap();
         assert_eq!(manifest_a, manifest_b);
     }
 
@@ -565,8 +628,10 @@ mod tests {
         generate("conflict", 100, Some(42), tmp_a.path().to_str().unwrap()).unwrap();
         generate("conflict", 100, Some(42), tmp_b.path().to_str().unwrap()).unwrap();
 
-        let manifest_a = fs::read_to_string(tmp_a.path().join("manifests/conflict.json")).unwrap();
-        let manifest_b = fs::read_to_string(tmp_b.path().join("manifests/conflict.json")).unwrap();
+        let manifest_a =
+            fs::read_to_string(tmp_a.path().join("manifests/conflict-100.json")).unwrap();
+        let manifest_b =
+            fs::read_to_string(tmp_b.path().join("manifests/conflict-100.json")).unwrap();
         assert_eq!(manifest_a, manifest_b);
     }
 
@@ -578,8 +643,10 @@ mod tests {
         generate("multi-hop", 100, Some(42), tmp_a.path().to_str().unwrap()).unwrap();
         generate("multi-hop", 100, Some(42), tmp_b.path().to_str().unwrap()).unwrap();
 
-        let manifest_a = fs::read_to_string(tmp_a.path().join("manifests/multi_hop.json")).unwrap();
-        let manifest_b = fs::read_to_string(tmp_b.path().join("manifests/multi_hop.json")).unwrap();
+        let manifest_a =
+            fs::read_to_string(tmp_a.path().join("manifests/multi_hop-100.json")).unwrap();
+        let manifest_b =
+            fs::read_to_string(tmp_b.path().join("manifests/multi_hop-100.json")).unwrap();
         assert_eq!(manifest_a, manifest_b);
     }
 
@@ -604,17 +671,28 @@ mod tests {
         .unwrap();
 
         let manifest_a =
-            fs::read_to_string(tmp_a.path().join("manifests/order_dependent.json")).unwrap();
+            fs::read_to_string(tmp_a.path().join("manifests/order_dependent-100.json")).unwrap();
         let manifest_b =
-            fs::read_to_string(tmp_b.path().join("manifests/order_dependent.json")).unwrap();
+            fs::read_to_string(tmp_b.path().join("manifests/order_dependent-100.json")).unwrap();
         assert_eq!(manifest_a, manifest_b);
     }
 
     #[test]
     fn unknown_suite_type_returns_error() {
         let tmp = tempdir().unwrap();
-        let err = generate("nonexistent", 100, Some(1), tmp.path().to_str().unwrap()).unwrap_err();
+        let out = tmp.path().join("bench");
+        let err = generate("nonexistent", 100, Some(1), out.to_str().unwrap()).unwrap_err();
         assert!(err.to_string().contains("unknown suite type"));
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn zero_token_generation_returns_error_without_outputs() {
+        let tmp = tempdir().unwrap();
+        let out = tmp.path().join("bench");
+        let err = generate("needle", 0, Some(1), out.to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("token count"));
+        assert!(!out.exists());
     }
 
     #[test]
@@ -638,9 +716,9 @@ mod tests {
         .unwrap();
 
         let manifest_a =
-            fs::read_to_string(tmp_a.path().join("manifests/position_sweep.json")).unwrap();
+            fs::read_to_string(tmp_a.path().join("manifests/position_sweep-100.json")).unwrap();
         let manifest_b =
-            fs::read_to_string(tmp_b.path().join("manifests/position_sweep.json")).unwrap();
+            fs::read_to_string(tmp_b.path().join("manifests/position_sweep-100.json")).unwrap();
         assert_eq!(manifest_a, manifest_b);
     }
 
@@ -656,7 +734,7 @@ mod tests {
         .unwrap();
 
         let manifest =
-            fs::read_to_string(tmp.path().join("manifests/position_sweep.json")).unwrap();
+            fs::read_to_string(tmp.path().join("manifests/position_sweep-100.json")).unwrap();
         let parsed: SuiteManifest = serde_json::from_str(&manifest).unwrap();
         assert_eq!(parsed.suites.len(), 5);
 
@@ -689,9 +767,9 @@ mod tests {
         .unwrap();
 
         let manifest_a =
-            fs::read_to_string(tmp_a.path().join("manifests/hallucination.json")).unwrap();
+            fs::read_to_string(tmp_a.path().join("manifests/hallucination-100.json")).unwrap();
         let manifest_b =
-            fs::read_to_string(tmp_b.path().join("manifests/hallucination.json")).unwrap();
+            fs::read_to_string(tmp_b.path().join("manifests/hallucination-100.json")).unwrap();
         assert_eq!(manifest_a, manifest_b);
     }
 
@@ -700,7 +778,8 @@ mod tests {
         let tmp = tempdir().unwrap();
         generate("hallucination", 100, Some(42), tmp.path().to_str().unwrap()).unwrap();
 
-        let manifest = fs::read_to_string(tmp.path().join("manifests/hallucination.json")).unwrap();
+        let manifest =
+            fs::read_to_string(tmp.path().join("manifests/hallucination-100.json")).unwrap();
         let parsed: SuiteManifest = serde_json::from_str(&manifest).unwrap();
         assert_eq!(parsed.suites.len(), 3);
 

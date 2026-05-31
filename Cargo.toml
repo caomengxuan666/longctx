@@ -2,6 +2,14 @@
 name = "longctx"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.86"
+description = "Long-context benchmark CLI for OpenAI-compatible model providers"
+readme = "README.md"
+repository = "https://github.com/LibSkills/longctx"
+license = "MIT"
+keywords = ["llm", "benchmark", "long-context", "cli"]
+categories = ["command-line-utilities", "development-tools::testing"]
+exclude = [".codex.toml", "/report.html"]
 
 [dependencies]
 clap = { features = ["derive"], version = "4" }

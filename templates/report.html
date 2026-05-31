@@ -92,7 +92,7 @@
     </div>
   </section>
   <table>
-    <thead><tr><th>ID</th><th>Suite</th><th>Token count</th><th>Model</th><th>Status</th><th>Attempts</th><th>Latency ms</th><th>Input tokens</th><th>HTTP</th><th>Request ID</th><th>Rate remaining</th><th>Rate reset</th><th>Error kind</th><th>Answer</th><th>Error</th></tr></thead>
+    <thead><tr><th>ID</th><th>Suite</th><th>Token count</th><th>Model</th><th>Status</th><th>Attempts</th><th>Latency ms</th><th>Input tokens</th><th>HTTP</th><th>Request ID</th><th>Rate remaining</th><th>Rate reset</th><th>Error kind</th><th>Routing</th><th>Routed context</th><th>Judge</th><th>Answer</th><th>Error</th></tr></thead>
     <tbody>
 {% for r in results %}
       <tr>
@@ -109,6 +109,9 @@
         <td>{{ r.rate_limit_remaining_display }}</td>
         <td>{{ r.rate_limit_reset_display }}</td>
         <td>{{ r.error_kind_display }}</td>
+        <td>{{ r.routing_display }}</td>
+        <td>{{ r.routing_context_display }}</td>
+        <td>{{ r.judge_display }}</td>
         <td class="answer">{{ r.answer_display }}</td>
         <td class="error">{{ r.error_display }}</td>
       </tr>

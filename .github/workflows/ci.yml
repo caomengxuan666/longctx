@@ -5,7 +5,8 @@ on:
   pull_request:
 
 jobs:
-  cargo:
+  stable-linux:
+    name: Stable Linux
     runs-on: ubuntu-latest
 
     steps:
@@ -29,3 +30,49 @@ jobs:
 
       - name: Build
         run: cargo build --locked
+
+      - name: Install smoke
+        run: |
+          cargo install --path . --locked
+          longctx --help
+
+      - name: Package
+        run: cargo package --locked --allow-dirty
+
+  msrv:
+    name: MSRV 1.86
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.86
+        uses: dtolnay/rust-toolchain@1.86
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check
+        run: cargo check --locked
+
+  test-platforms:
+    name: Test ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --locked

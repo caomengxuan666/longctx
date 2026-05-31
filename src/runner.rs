@@ -1,9 +1,14 @@
 use crate::benchmark::{
-    BenchmarkResult, Config, ErrorKind, GraderConfig, ProviderConfig, RunConfig, RunMetadata,
-    SuiteManifest, TestCase, SCHEMA_VERSION,
+    ArtifactFingerprint, BenchmarkResult, Config, ErrorKind, GraderConfig, ProviderConfig,
+    RoutingDecision, RunConfig, RunMetadata, SuiteManifest, TestCase, SCHEMA_VERSION,
+};
+use crate::context_index::{
+    is_auto_context, load_or_build_context_index, load_or_build_context_index_in_memory,
+    route_context, validate_context_index, write_context_index, ContextIndex,
 };
 use crate::grader::{grade, grade_with_llm};
 use crate::tokenizer::TokenCounter;
+use crate::validator::{resolve_context_path, validate_loaded_benchmark_with_options};
 use anyhow::{anyhow, Context, Result};
 use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
@@ -19,8 +24,41 @@ use tokio::time::sleep;
 use walkdir::WalkDir;
 
 pub async fn run_benchmarks(bench_dir: &str) -> Result<()> {
+    run_benchmarks_with_options(bench_dir, RunOptions::default()).await
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RunOptions {
+    pub force: bool,
+    pub dry_run: bool,
+    pub filter: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunPlanSummary {
+    pub total_count: usize,
+    pub selected_count: usize,
+    pub auto_context_count: usize,
+    pub routed_auto_context_count: usize,
+    pub provider_model: String,
+    pub suites: Vec<String>,
+}
+
+pub async fn run_benchmarks_with_options(bench_dir: &str, options: RunOptions) -> Result<()> {
+    if options.dry_run {
+        dry_run_benchmarks(bench_dir, options)?;
+        return Ok(());
+    }
     let bench_path = Path::new(bench_dir);
-    let config = read_config(&bench_path.join("config.toml"))?;
+    let prepared = prepare_benchmark_run(bench_path, &options, true)?;
+    let PreparedRun {
+        config,
+        tests,
+        context_index,
+        ..
+    } = prepared;
+
     let api_key = env::var(&config.provider.api_key_env).with_context(|| {
         format!(
             "environment variable {} is not set",
@@ -28,13 +66,19 @@ pub async fn run_benchmarks(bench_dir: &str) -> Result<()> {
         )
     })?;
 
-    let tests = read_tests(bench_path)?;
-    if tests.is_empty() {
-        return Err(anyhow!("no benchmark .json files found in {bench_dir}"));
-    }
-
     let results_path = bench_path.join("results.jsonl");
     let metadata_path = bench_path.join("run.json");
+    let request_log_path = config
+        .run
+        .log_requests
+        .then(|| bench_path.join(&config.run.request_log_path));
+    ensure_output_paths_can_be_written(
+        &results_path,
+        &metadata_path,
+        request_log_path.as_deref(),
+        options.force,
+    )?;
+
     let run_started = Instant::now();
     let started_at_unix_ms = unix_ms_now();
     let mut metadata = build_run_metadata(
@@ -43,7 +87,7 @@ pub async fn run_benchmarks(bench_dir: &str) -> Result<()> {
         started_at_unix_ms,
         &config,
         &tests,
-    );
+    )?;
     write_run_metadata(&metadata_path, &metadata)?;
 
     let mut results_file = OpenOptions::new()
@@ -66,16 +110,17 @@ pub async fn run_benchmarks(bench_dir: &str) -> Result<()> {
         api_key,
         bench_path.to_path_buf(),
         tests_for_run,
+        context_index,
         &counter,
+        &mut results_file,
     )
     .await?;
 
-    for result in &results {
-        writeln!(results_file, "{}", serde_json::to_string(&result)?)?;
-    }
     if config.run.log_requests {
-        let log_path = bench_path.join(&config.run.request_log_path);
-        write_request_logs(bench_path, &log_path, &tests, &results)?;
+        let log_path = request_log_path
+            .as_deref()
+            .unwrap_or_else(|| Path::new(&config.run.request_log_path));
+        write_request_logs(bench_path, log_path, &tests, &results)?;
     }
     metadata.finished_at_unix_ms = Some(unix_ms_now());
     metadata.duration_ms = Some(run_started.elapsed().as_millis() as u64);
@@ -84,14 +129,176 @@ pub async fn run_benchmarks(bench_dir: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn dry_run_benchmarks(bench_dir: &str, options: RunOptions) -> Result<RunPlanSummary> {
+    let bench_path = Path::new(bench_dir);
+    let prepared = prepare_benchmark_run(bench_path, &options, false)?;
+    Ok(prepared.summary)
+}
+
+struct PreparedRun {
+    config: Config,
+    tests: Vec<TestCase>,
+    context_index: Option<ContextIndex>,
+    summary: RunPlanSummary,
+}
+
+fn prepare_benchmark_run(
+    bench_path: &Path,
+    options: &RunOptions,
+    write_missing_context_index: bool,
+) -> Result<PreparedRun> {
+    let config = read_config(&bench_path.join("config.toml"))?;
+    let all_tests = read_tests(bench_path)?;
+    if all_tests.is_empty() {
+        return Err(anyhow!(
+            "no benchmark .json files found in {}",
+            bench_path.display()
+        ));
+    }
+    let total_count = all_tests.len();
+    let tests = select_tests(all_tests, options);
+    if tests.is_empty() {
+        anyhow::bail!("no benchmark tests selected by the current run options");
+    }
+    validate_loaded_benchmark_with_options(
+        bench_path,
+        &config,
+        &tests,
+        false,
+        write_missing_context_index,
+    )?;
+
+    let context_index = if tests.iter().any(|test| is_auto_context(&test.context)) {
+        let index = if write_missing_context_index {
+            load_or_build_context_index(bench_path)?
+        } else {
+            load_or_build_context_index_in_memory(bench_path)?
+        };
+        validate_context_index(bench_path, &index)?;
+        if write_missing_context_index {
+            write_context_index(bench_path, &index)?;
+        }
+        Some(index)
+    } else {
+        None
+    };
+
+    let auto_context_count = tests
+        .iter()
+        .filter(|test| is_auto_context(&test.context))
+        .count();
+    let routed_auto_context_count =
+        validate_auto_routing(&tests, context_index.as_ref(), options.dry_run)?;
+    let summary = RunPlanSummary {
+        total_count,
+        selected_count: tests.len(),
+        auto_context_count,
+        routed_auto_context_count,
+        provider_model: config.provider.model.clone(),
+        suites: suite_names(&tests),
+    };
+
+    Ok(PreparedRun {
+        config,
+        tests,
+        context_index,
+        summary,
+    })
+}
+
+fn select_tests(tests: Vec<TestCase>, options: &RunOptions) -> Vec<TestCase> {
+    let mut selected = if let Some(filter) = options.filter.as_deref() {
+        let filter = filter.to_ascii_lowercase();
+        tests
+            .into_iter()
+            .filter(|test| test_matches_filter(test, &filter))
+            .collect::<Vec<_>>()
+    } else {
+        tests
+    };
+
+    if let Some(limit) = options.limit {
+        selected.truncate(limit);
+    }
+    selected
+}
+
+fn test_matches_filter(test: &TestCase, filter: &str) -> bool {
+    test.id.to_ascii_lowercase().contains(filter)
+        || test
+            .metadata
+            .get("suite")
+            .map(|suite| suite.to_ascii_lowercase().contains(filter))
+            .unwrap_or(false)
+}
+
+fn validate_auto_routing(
+    tests: &[TestCase],
+    context_index: Option<&ContextIndex>,
+    fail_on_error: bool,
+) -> Result<usize> {
+    let mut routed = 0;
+    for test in tests.iter().filter(|test| is_auto_context(&test.context)) {
+        let Some(index) = context_index else {
+            anyhow::bail!("context routing requested but context index is unavailable");
+        };
+        let decision = route_context(test, index);
+        if decision.selected_context_path.is_none() {
+            if fail_on_error {
+                anyhow::bail!(
+                    "context routing failed for {}: {}",
+                    test.id,
+                    decision
+                        .reason
+                        .as_deref()
+                        .unwrap_or("no context candidate selected")
+                );
+            }
+            continue;
+        }
+        routed += 1;
+    }
+    Ok(routed)
+}
+
+fn ensure_output_paths_can_be_written(
+    results_path: &Path,
+    metadata_path: &Path,
+    request_log_path: Option<&Path>,
+    force: bool,
+) -> Result<()> {
+    if force {
+        return Ok(());
+    }
+    if results_path.exists() {
+        bail_existing_output(results_path)?;
+    }
+    if metadata_path.exists() {
+        bail_existing_output(metadata_path)?;
+    }
+    if let Some(path) = request_log_path {
+        if path.exists() {
+            bail_existing_output(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn bail_existing_output(path: &Path) -> Result<()> {
+    anyhow::bail!(
+        "refusing to overwrite existing output {}; rerun with --force to replace it",
+        path.display()
+    )
+}
+
 fn build_run_metadata(
     bench_path: &Path,
     results_path: &Path,
     started_at_unix_ms: u64,
     config: &Config,
     tests: &[TestCase],
-) -> RunMetadata {
-    RunMetadata {
+) -> Result<RunMetadata> {
+    Ok(RunMetadata {
         schema_version: SCHEMA_VERSION,
         bench_dir: bench_path.to_string_lossy().into_owned(),
         results_path: results_path.to_string_lossy().into_owned(),
@@ -113,12 +320,57 @@ fn build_run_metadata(
             None
         },
         suites: suite_names(tests),
-    }
+        artifact_fingerprints: artifact_fingerprints(bench_path)?,
+    })
 }
 
 fn write_run_metadata(path: &Path, metadata: &RunMetadata) -> Result<()> {
     let json = serde_json::to_string_pretty(metadata)?;
     fs::write(path, json).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn artifact_fingerprints(bench_path: &Path) -> Result<Vec<ArtifactFingerprint>> {
+    let mut paths = Vec::new();
+    collect_artifact_files(&bench_path.join("manifests"), &mut paths)?;
+    collect_artifact_files(&bench_path.join("contexts"), &mut paths)?;
+    let index_path = bench_path.join(crate::context_index::CONTEXT_INDEX_FILE);
+    if index_path.is_file() {
+        paths.push(index_path);
+    }
+    paths.sort();
+    paths.dedup();
+
+    let mut fingerprints = Vec::with_capacity(paths.len());
+    for path in paths {
+        let metadata =
+            fs::metadata(&path).with_context(|| format!("failed to stat {}", path.display()))?;
+        fingerprints.push(ArtifactFingerprint {
+            path: relative_path(bench_path, &path),
+            sha256: sha256_file(&path)?,
+            bytes: metadata.len(),
+        });
+    }
+    Ok(fingerprints)
+}
+
+fn collect_artifact_files(root: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+    for entry in WalkDir::new(root).min_depth(1) {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            paths.push(entry.path().to_path_buf());
+        }
+    }
+    Ok(())
+}
+
+fn relative_path(base: &Path, path: &Path) -> String {
+    path.strip_prefix(base)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 fn write_request_logs(
@@ -140,10 +392,18 @@ fn write_request_logs(
         .with_context(|| format!("failed to open request log {}", log_path.display()))?;
 
     for (test, result) in tests.iter().zip(results.iter()) {
-        let request_hash = load_context(bench_path, &test.context)
-            .map(|context| build_prompt(&context, &test.question))
-            .map(|prompt| sha256_hex(&prompt))
-            .ok();
+        let routing = result.routing.as_ref();
+        let context_path = routing
+            .and_then(|routing| routing.selected_context_path.as_deref())
+            .unwrap_or(&test.context);
+        let request_hash = if result.attempts > 0 {
+            load_context(bench_path, context_path)
+                .map(|context| build_prompt(&context, &test.question))
+                .map(|prompt| sha256_hex(&prompt))
+                .ok()
+        } else {
+            None
+        };
         let response_hash = result
             .answer
             .as_ref()
@@ -162,6 +422,10 @@ fn write_request_logs(
             output_tokens: result.output_tokens,
             passed: result.passed,
             error_kind: result.error_kind.clone(),
+            routing_status: routing.map(|routing| routing.status.clone()),
+            routing_reason: routing.and_then(|routing| routing.reason.clone()),
+            selected_context_path: routing
+                .and_then(|routing| routing.selected_context_path.clone()),
             request_sha256: request_hash,
             response_sha256: response_hash,
         };
@@ -200,7 +464,9 @@ async fn run_all(
     api_key: String,
     bench_path: PathBuf,
     tests: Vec<TestCase>,
+    context_index: Option<ContextIndex>,
     counter: &TokenCounter,
+    results_file: &mut impl Write,
 ) -> Result<Vec<BenchmarkResult>> {
     let concurrency = run.concurrency.max(1);
     let total = tests.len();
@@ -214,6 +480,7 @@ async fn run_all(
                 .await
                 .context("benchmark task set ended unexpectedly")?
                 .context("benchmark task panicked")?;
+            write_result_row(results_file, &result)?;
             ordered[completed_idx] = Some(result);
         }
 
@@ -223,6 +490,7 @@ async fn run_all(
         let grader_config = grader_config.clone();
         let api_key = api_key.clone();
         let bench_path = bench_path.clone();
+        let context_index = context_index.clone();
         let counter = counter.clone();
         tasks.spawn(async move {
             let result = run_one(
@@ -233,6 +501,7 @@ async fn run_all(
                 &api_key,
                 &bench_path,
                 &test,
+                context_index.as_ref(),
                 &counter,
             )
             .await;
@@ -242,6 +511,7 @@ async fn run_all(
 
     while let Some(joined) = tasks.join_next().await {
         let (idx, result) = joined.context("benchmark task panicked")?;
+        write_result_row(results_file, &result)?;
         ordered[idx] = Some(result);
     }
 
@@ -250,6 +520,12 @@ async fn run_all(
         .enumerate()
         .map(|(idx, result)| result.with_context(|| format!("missing result for test index {idx}")))
         .collect()
+}
+
+fn write_result_row(writer: &mut impl Write, result: &BenchmarkResult) -> Result<()> {
+    writeln!(writer, "{}", serde_json::to_string(result)?)?;
+    writer.flush()?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -261,10 +537,45 @@ async fn run_one(
     api_key: &str,
     bench_dir: &Path,
     test: &TestCase,
+    context_index: Option<&ContextIndex>,
     counter: &TokenCounter,
 ) -> BenchmarkResult {
     let started = Instant::now();
-    let context = match load_context(bench_dir, &test.context) {
+    let (context_ref, routing) = match resolve_context_reference(test, context_index) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let (error, routing) = *error;
+            return BenchmarkResult {
+                schema_version: SCHEMA_VERSION,
+                suite: suite_name(test),
+                token_count: test_token_count(test),
+                id: test.id.clone(),
+                provider_model: Some(provider.model.clone()),
+                provider_base_url: Some(provider.base_url.clone()),
+                http_status: None,
+                request_id: None,
+                rate_limit_remaining: None,
+                rate_limit_reset: None,
+                passed: false,
+                attempts: 0,
+                latency_ms: started.elapsed().as_millis() as u64,
+                input_tokens: 0,
+                output_tokens: 0,
+                answer: None,
+                error: Some(error),
+                error_kind: Some(ErrorKind::ContextRoute),
+                routing,
+                judge_latency_ms: None,
+                judge_input_tokens: None,
+                judge_output_tokens: None,
+                judge_http_status: None,
+                judge_attempts: None,
+                judge_error: None,
+                metadata: test.metadata.clone(),
+            };
+        }
+    };
+    let context = match load_context(bench_dir, &context_ref) {
         Ok(context) => context,
         Err(error) => {
             return BenchmarkResult {
@@ -286,8 +597,13 @@ async fn run_one(
                 answer: None,
                 error: Some(error.to_string()),
                 error_kind: Some(ErrorKind::ContextLoad),
+                routing,
                 judge_latency_ms: None,
                 judge_input_tokens: None,
+                judge_output_tokens: None,
+                judge_http_status: None,
+                judge_attempts: None,
+                judge_error: None,
                 metadata: test.metadata.clone(),
             };
         }
@@ -324,31 +640,55 @@ async fn run_one(
 
     match response {
         Ok(output) => {
-            let (passed, judge_lat, judge_tok) =
-                if matches!(test.grader, crate::benchmark::Grader::LlmJudge) {
-                    let judge_model = grader_config
-                        .judge_model
-                        .as_deref()
-                        .unwrap_or(&provider.model);
-                    let judge_result = grade_with_llm(
-                        &output.answer,
-                        test,
-                        &context,
-                        client,
-                        &provider.base_url,
-                        api_key,
-                        judge_model,
-                        counter,
-                    )
-                    .await;
-                    (
-                        judge_result.passed,
-                        Some(judge_result.latency_ms),
-                        Some(judge_result.input_tokens),
-                    )
-                } else {
-                    (grade(&output.answer, test), None, None)
-                };
+            let (
+                passed,
+                judge_lat,
+                judge_input_tok,
+                judge_output_tok,
+                judge_http_status,
+                judge_attempts,
+                judge_error,
+            ) = if matches!(test.grader, crate::benchmark::Grader::LlmJudge) {
+                let judge_model = grader_config
+                    .judge_model
+                    .as_deref()
+                    .unwrap_or(&provider.model);
+                let judge_result = grade_with_llm(
+                    &output.answer,
+                    test,
+                    &context,
+                    client,
+                    &provider.base_url,
+                    api_key,
+                    judge_model,
+                    provider.request_style,
+                    run.request_timeout_secs,
+                    run.max_retries,
+                    run.retry_backoff_ms,
+                    counter,
+                )
+                .await;
+                (
+                    judge_result.passed,
+                    Some(judge_result.latency_ms),
+                    Some(judge_result.input_tokens),
+                    Some(judge_result.output_tokens),
+                    judge_result.http_status,
+                    Some(judge_result.attempts),
+                    judge_result.error,
+                )
+            } else {
+                (
+                    grade(&output.answer, test),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            };
+            let judge_failed = judge_error.is_some();
             BenchmarkResult {
                 schema_version: SCHEMA_VERSION,
                 suite: suite_name(test),
@@ -368,16 +708,25 @@ async fn run_one(
                 answer: Some(output.answer),
                 error: if passed {
                     None
+                } else if let Some(error) = &judge_error {
+                    Some(format!("LLM judge failed: {error}"))
                 } else {
                     Some("answer did not satisfy grader".to_string())
                 },
                 error_kind: if passed {
                     None
+                } else if judge_failed {
+                    Some(ErrorKind::Judge)
                 } else {
                     Some(ErrorKind::Validation)
                 },
+                routing,
                 judge_latency_ms: judge_lat,
-                judge_input_tokens: judge_tok,
+                judge_input_tokens: judge_input_tok,
+                judge_output_tokens: judge_output_tok,
+                judge_http_status,
+                judge_attempts,
+                judge_error,
                 metadata: test.metadata.clone(),
             }
         }
@@ -392,6 +741,7 @@ async fn run_one(
             request_id: failure.request_id,
             rate_limit_remaining: failure.rate_limit_remaining,
             rate_limit_reset: failure.rate_limit_reset,
+            routing,
             error: failure.error,
         }),
     }
@@ -660,6 +1010,7 @@ struct ErrorResultInput<'a, E> {
     request_id: Option<String>,
     rate_limit_remaining: Option<String>,
     rate_limit_reset: Option<String>,
+    routing: Option<RoutingDecision>,
     error: E,
 }
 
@@ -683,9 +1034,48 @@ fn error_result<E: std::fmt::Display>(input: ErrorResultInput<'_, E>) -> Benchma
         answer: None,
         error: Some(input.error.to_string()),
         error_kind: Some(input.kind),
+        routing: input.routing,
         judge_latency_ms: None,
         judge_input_tokens: None,
+        judge_output_tokens: None,
+        judge_http_status: None,
+        judge_attempts: None,
+        judge_error: None,
         metadata: input.test.metadata.clone(),
+    }
+}
+
+type ContextResolution = (String, Option<RoutingDecision>);
+type ContextResolutionError = Box<(String, Option<RoutingDecision>)>;
+
+fn resolve_context_reference(
+    test: &TestCase,
+    context_index: Option<&ContextIndex>,
+) -> std::result::Result<ContextResolution, ContextResolutionError> {
+    if !is_auto_context(&test.context) {
+        return Ok((test.context.clone(), None));
+    }
+
+    let Some(index) = context_index else {
+        return Err(Box::new((
+            "context routing requested but context index is unavailable".to_string(),
+            None,
+        )));
+    };
+
+    let decision = route_context(test, index);
+    if let Some(path) = decision.selected_context_path.clone() {
+        Ok((path, Some(decision)))
+    } else {
+        let message = format!(
+            "context routing failed for {}: {}",
+            test.id,
+            decision
+                .reason
+                .as_deref()
+                .unwrap_or("no context candidate selected")
+        );
+        Err(Box::new((message, Some(decision))))
     }
 }
 
@@ -707,35 +1097,22 @@ pub(crate) fn read_config(path: &Path) -> Result<Config> {
 }
 
 pub(crate) fn read_tests(bench_dir: &Path) -> Result<Vec<TestCase>> {
-    let search_root = if bench_dir.join("manifests").is_dir() {
-        bench_dir.join("manifests")
-    } else {
-        bench_dir.to_path_buf()
-    };
-
-    let mut paths = Vec::new();
-    for entry in WalkDir::new(&search_root).min_depth(1) {
-        let entry = entry?;
-        let path = entry.path();
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
-        }
-        if path.file_name().and_then(|name| name.to_str()) == Some("results.json") {
-            continue;
-        }
-        paths.push(path.to_path_buf());
-    }
-    paths.sort();
-
     let mut tests = Vec::new();
-    for path in paths {
+    for path in benchmark_json_paths(bench_dir)? {
         let text = fs::read_to_string(&path)
             .with_context(|| format!("failed to read test file {}", path.display()))?;
         if let Ok(manifest) = serde_json::from_str::<SuiteManifest>(&text) {
-            tests.extend(manifest.suites);
+            if manifest.schema_version > SCHEMA_VERSION {
+                anyhow::bail!(
+                    "manifest {} schema_version {} is newer than supported schema_version {}",
+                    path.display(),
+                    manifest.schema_version,
+                    SCHEMA_VERSION
+                );
+            }
+            tests.extend(manifest.suites.into_iter().map(|test| {
+                enrich_test_from_manifest(test, &manifest.name, manifest.token_count, manifest.seed)
+            }));
         } else {
             let test = serde_json::from_str::<TestCase>(&text)
                 .with_context(|| format!("failed to parse {}", path.display()))?;
@@ -745,25 +1122,74 @@ pub(crate) fn read_tests(bench_dir: &Path) -> Result<Vec<TestCase>> {
     Ok(tests)
 }
 
+fn benchmark_json_paths(bench_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    let manifests_dir = bench_dir.join("manifests");
+    if manifests_dir.is_dir() {
+        collect_json_files(&manifests_dir, usize::MAX, &mut paths)?;
+    }
+    collect_json_files(bench_dir, 1, &mut paths)?;
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn collect_json_files(root: &Path, max_depth: usize, paths: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in WalkDir::new(root).min_depth(1).max_depth(max_depth) {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        if is_generated_json_artifact(path) {
+            continue;
+        }
+        paths.push(path.to_path_buf());
+    }
+    Ok(())
+}
+
+fn enrich_test_from_manifest(
+    mut test: TestCase,
+    manifest_name: &str,
+    token_count: u64,
+    seed: u64,
+) -> TestCase {
+    test.metadata
+        .entry("suite".to_string())
+        .or_insert_with(|| manifest_name.to_string());
+    test.metadata
+        .entry("token_count".to_string())
+        .or_insert_with(|| token_count.to_string());
+    test.metadata
+        .entry("seed".to_string())
+        .or_insert_with(|| seed.to_string());
+    test
+}
+
+fn is_generated_json_artifact(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(
+            "context.index.json"
+                | "results.json"
+                | "run.json"
+                | "report.json"
+                | "compare.json"
+                | "comparison.json"
+        )
+    )
+}
+
 fn load_context(bench_dir: &Path, context: &str) -> Result<String> {
-    let context_path = PathBuf::from(context);
-    if context_path.is_absolute() && context_path.exists() {
-        return fs::read_to_string(&context_path)
-            .with_context(|| format!("failed to read context {}", context_path.display()));
+    match resolve_context_path(bench_dir, context)? {
+        Some(path) => fs::read_to_string(&path)
+            .with_context(|| format!("failed to read context {}", path.display())),
+        None => Ok(context.to_string()),
     }
-
-    let relative = bench_dir.join(&context_path);
-    if relative.exists() {
-        return fs::read_to_string(&relative)
-            .with_context(|| format!("failed to read context {}", relative.display()));
-    }
-
-    if context_path.exists() {
-        return fs::read_to_string(&context_path)
-            .with_context(|| format!("failed to read context {}", context_path.display()));
-    }
-
-    Ok(context.to_string())
 }
 
 #[derive(Debug, Serialize)]
@@ -912,6 +1338,12 @@ struct HttpExchangeLog {
     #[serde(skip_serializing_if = "Option::is_none")]
     error_kind: Option<ErrorKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    routing_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    routing_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_context_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     request_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_sha256: Option<String>,
@@ -927,6 +1359,13 @@ fn sha256_hex(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 #[cfg(test)]
@@ -1014,6 +1453,43 @@ request_style = "responses"
         let tests = read_tests(tmp.path()).unwrap();
         assert_eq!(tests.len(), 1);
         assert_eq!(tests[0].id, "needle-100");
+        assert_eq!(tests[0].metadata.get("suite"), Some(&"needle".to_string()));
+        assert_eq!(
+            tests[0].metadata.get("token_count"),
+            Some(&"100".to_string())
+        );
+        assert_eq!(tests[0].metadata.get("seed"), Some(&"7".to_string()));
+    }
+
+    #[test]
+    fn read_tests_rejects_newer_manifest_schema_version() {
+        let tmp = tempdir().unwrap();
+        let manifests = tmp.path().join("manifests");
+        fs::create_dir_all(&manifests).unwrap();
+        fs::write(
+            manifests.join("needle.json"),
+            r#"
+{
+  "schema_version": 999,
+  "name": "needle",
+  "token_count": 100,
+  "seed": 7,
+  "suites": [{
+    "schema_version": 1,
+    "id": "needle-100",
+    "context": "contexts/needle_context.txt",
+    "question": "q",
+    "expected": ["a"],
+    "grader": "Exact",
+    "metadata": {}
+  }]
+}
+"#,
+        )
+        .unwrap();
+
+        let error = read_tests(tmp.path()).unwrap_err();
+        assert!(error.to_string().contains("schema_version 999"));
     }
 
     #[test]
@@ -1042,6 +1518,112 @@ request_style = "responses"
             tests[0].metadata.get("token_count"),
             Some(&"100000".to_string())
         );
+    }
+
+    #[test]
+    fn read_tests_keeps_flat_layout_when_manifests_dir_exists() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("manifests")).unwrap();
+        fs::write(
+            tmp.path().join("needle.json"),
+            r#"
+{
+  "schema_version": 1,
+  "id": "flat-needle",
+  "context": "contexts/needle_context.txt",
+  "question": "q",
+  "expected": ["a"],
+  "grader": "Exact",
+  "metadata": {"suite": "needle", "token_count": "100000"}
+}
+"#,
+        )
+        .unwrap();
+
+        let tests = read_tests(tmp.path()).unwrap();
+        assert_eq!(tests.len(), 1);
+        assert_eq!(tests[0].id, "flat-needle");
+    }
+
+    #[test]
+    fn read_tests_supports_mixed_flat_and_manifest_layouts() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("manifests")).unwrap();
+        fs::write(
+            tmp.path().join("flat.json"),
+            r#"
+{
+  "schema_version": 1,
+  "id": "flat-needle",
+  "context": "contexts/flat.txt",
+  "question": "q",
+  "expected": ["a"],
+  "grader": "Exact",
+  "metadata": {"suite": "needle", "token_count": "100"}
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("manifests/manifest.json"),
+            r#"
+{
+  "schema_version": 1,
+  "name": "needle",
+  "token_count": 200,
+  "seed": 7,
+  "suites": [{
+    "schema_version": 1,
+    "id": "manifest-needle",
+    "context": "contexts/manifest.txt",
+    "question": "q",
+    "expected": ["b"],
+    "grader": "Exact",
+    "metadata": {}
+  }]
+}
+"#,
+        )
+        .unwrap();
+
+        let tests = read_tests(tmp.path()).unwrap();
+        assert_eq!(tests.len(), 2);
+        assert!(tests.iter().any(|test| test.id == "flat-needle"));
+        assert!(tests.iter().any(|test| test.id == "manifest-needle"));
+    }
+
+    #[test]
+    fn read_tests_ignores_generated_root_json_artifacts_in_flat_layout() {
+        let tmp = tempdir().unwrap();
+        fs::write(
+            tmp.path().join("needle.json"),
+            r#"
+{
+  "schema_version": 1,
+  "id": "flat-needle",
+  "context": "contexts/needle_context.txt",
+  "question": "q",
+  "expected": ["a"],
+  "grader": "Exact",
+  "metadata": {"suite": "needle", "token_count": "100000"}
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("context.index.json"),
+            r#"{"schema_version":1,"bench_id":"bench","created_at_unix_ms":1,"contexts":[]}"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("run.json"),
+            r#"{"schema_version":1,"bench_dir":"bench","results_path":"results.jsonl","started_at_unix_ms":1,"test_count":1,"provider_model":"m","provider_base_url":"u","provider_request_style":"chat-completions","request_timeout_secs":120,"max_retries":2,"retry_backoff_ms":500,"concurrency":1,"suites":["needle"]}"#,
+        )
+        .unwrap();
+
+        let tests = read_tests(tmp.path()).unwrap();
+        assert_eq!(tests.len(), 1);
+        assert_eq!(tests[0].id, "flat-needle");
     }
 
     #[test]
@@ -1078,7 +1660,18 @@ request_style = "responses"
             metadata,
         }];
 
-        let snapshot = build_run_metadata(bench_dir.path(), &results_path, 1234, &config, &tests);
+        fs::create_dir_all(bench_dir.path().join("contexts")).unwrap();
+        fs::create_dir_all(bench_dir.path().join("manifests")).unwrap();
+        fs::write(
+            bench_dir.path().join("contexts/needle_context.txt"),
+            "context",
+        )
+        .unwrap();
+        fs::write(bench_dir.path().join("manifests/needle.json"), "{}").unwrap();
+        fs::write(bench_dir.path().join("context.index.json"), "{}").unwrap();
+
+        let snapshot =
+            build_run_metadata(bench_dir.path(), &results_path, 1234, &config, &tests).unwrap();
         assert_eq!(snapshot.schema_version, SCHEMA_VERSION);
         assert_eq!(snapshot.test_count, 1);
         assert_eq!(snapshot.provider_model, "example-model");
@@ -1091,6 +1684,15 @@ request_style = "responses"
         );
         assert_eq!(snapshot.suites, vec!["needle"]);
         assert_eq!(snapshot.finished_at_unix_ms, None);
+        assert_eq!(snapshot.artifact_fingerprints.len(), 3);
+        assert!(snapshot
+            .artifact_fingerprints
+            .iter()
+            .any(|artifact| artifact.path == "contexts/needle_context.txt"));
+        assert!(snapshot
+            .artifact_fingerprints
+            .iter()
+            .all(|artifact| !artifact.sha256.is_empty() && artifact.bytes > 0));
     }
 
     #[test]
@@ -1174,8 +1776,13 @@ request_style = "responses"
             answer: Some("orchid-123".to_string()),
             error: None,
             error_kind: None,
+            routing: None,
             judge_latency_ms: None,
             judge_input_tokens: None,
+            judge_output_tokens: None,
+            judge_http_status: None,
+            judge_attempts: None,
+            judge_error: None,
             metadata: BTreeMap::new(),
         };
         let log_path = tmp.path().join("reports/http-log.jsonl");
@@ -1187,6 +1794,232 @@ request_style = "responses"
         assert!(log.contains("response_sha256"));
         assert!(!log.contains("archive access code"));
         assert!(!log.contains("orchid-123"));
+    }
+
+    #[test]
+    fn request_logs_do_not_hash_unsent_context_route_failures() {
+        let tmp = tempdir().unwrap();
+        let test = TestCase {
+            schema_version: SCHEMA_VERSION,
+            id: "auto-1".to_string(),
+            context: "auto".to_string(),
+            question: "What is the code?".to_string(),
+            expected: vec!["a".to_string()],
+            grader: crate::benchmark::Grader::Exact,
+            metadata: BTreeMap::new(),
+        };
+        let result = BenchmarkResult {
+            schema_version: SCHEMA_VERSION,
+            suite: Some("needle".to_string()),
+            token_count: Some(100),
+            id: "auto-1".to_string(),
+            provider_model: Some("example-model".to_string()),
+            provider_base_url: Some("https://api.example.test/v1".to_string()),
+            http_status: None,
+            request_id: None,
+            rate_limit_remaining: None,
+            rate_limit_reset: None,
+            passed: false,
+            attempts: 0,
+            latency_ms: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            answer: None,
+            error: Some("context routing failed".to_string()),
+            error_kind: Some(ErrorKind::ContextRoute),
+            routing: Some(RoutingDecision {
+                schema_version: SCHEMA_VERSION,
+                test_id: "auto-1".to_string(),
+                selected_context_id: None,
+                selected_context_path: None,
+                method: "none".to_string(),
+                status: "ambiguous".to_string(),
+                confidence: 0.0,
+                candidates: vec![],
+                llm_router_used: false,
+                input_tokens: 0,
+                output_tokens: 0,
+                latency_ms: 0,
+                reason: Some("local_router_confidence_below_threshold".to_string()),
+            }),
+            judge_latency_ms: None,
+            judge_input_tokens: None,
+            judge_output_tokens: None,
+            judge_http_status: None,
+            judge_attempts: None,
+            judge_error: None,
+            metadata: BTreeMap::new(),
+        };
+        let log_path = tmp.path().join("reports/http-log.jsonl");
+
+        write_request_logs(tmp.path(), &log_path, &[test], &[result]).unwrap();
+        let log = fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("routing_status"));
+        assert!(log.contains("local_router_confidence_below_threshold"));
+        assert!(!log.contains("request_sha256"));
+    }
+
+    #[test]
+    fn run_output_guard_rejects_existing_results_without_force() {
+        let tmp = tempdir().unwrap();
+        let results = tmp.path().join("results.jsonl");
+        let metadata = tmp.path().join("run.json");
+        fs::write(&results, "old results").unwrap();
+
+        let error =
+            ensure_output_paths_can_be_written(&results, &metadata, None, false).unwrap_err();
+        assert!(error.to_string().contains("refusing to overwrite"));
+        ensure_output_paths_can_be_written(&results, &metadata, None, true).unwrap();
+    }
+
+    #[test]
+    fn run_output_guard_rejects_existing_run_metadata_without_force() {
+        let tmp = tempdir().unwrap();
+        let results = tmp.path().join("results.jsonl");
+        let metadata = tmp.path().join("run.json");
+        fs::write(&metadata, "{}").unwrap();
+
+        let error =
+            ensure_output_paths_can_be_written(&results, &metadata, None, false).unwrap_err();
+        assert!(error.to_string().contains("run.json"));
+        ensure_output_paths_can_be_written(&results, &metadata, None, true).unwrap();
+    }
+
+    #[test]
+    fn dry_run_applies_filter_and_limit_without_api_key_or_outputs() {
+        let tmp = tempdir().unwrap();
+        fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[provider]
+base_url = "https://api.example.test/v1"
+api_key_env = "MISSING_DRY_RUN_KEY"
+model = "example-model"
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("contexts")).unwrap();
+        fs::create_dir_all(tmp.path().join("manifests")).unwrap();
+        fs::write(tmp.path().join("contexts/test.txt"), "context").unwrap();
+        fs::write(
+            tmp.path().join("manifests/needle.json"),
+            r#"
+{
+  "schema_version": 1,
+  "name": "needle",
+  "token_count": 100,
+  "seed": 7,
+  "suites": [
+    {
+      "schema_version": 1,
+      "id": "needle-a",
+      "context": "contexts/test.txt",
+      "question": "q",
+      "expected": ["a"],
+      "grader": "Exact",
+      "metadata": {"suite": "needle"}
+    },
+    {
+      "schema_version": 1,
+      "id": "needle-b",
+      "context": "contexts/test.txt",
+      "question": "q",
+      "expected": ["b"],
+      "grader": "Exact",
+      "metadata": {"suite": "needle"}
+    }
+  ]
+}
+"#,
+        )
+        .unwrap();
+
+        let summary = dry_run_benchmarks(
+            tmp.path().to_str().unwrap(),
+            RunOptions {
+                dry_run: true,
+                filter: Some("needle".to_string()),
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.total_count, 2);
+        assert_eq!(summary.selected_count, 1);
+        assert_eq!(summary.provider_model, "example-model");
+        assert_eq!(summary.suites, vec!["needle"]);
+        assert!(!tmp.path().join("results.jsonl").exists());
+        assert!(!tmp.path().join("run.json").exists());
+    }
+
+    #[test]
+    fn dry_run_resolves_auto_context_without_writing_index() {
+        let tmp = tempdir().unwrap();
+        fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[provider]
+base_url = "https://api.example.test/v1"
+api_key_env = "MISSING_DRY_RUN_KEY"
+model = "example-model"
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("contexts")).unwrap();
+        fs::create_dir_all(tmp.path().join("manifests")).unwrap();
+        fs::write(
+            tmp.path().join("contexts/needle_context.txt"),
+            "Needle fact: the archive access code is ORCHID-1.",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("manifests/needle.json"),
+            r#"
+{
+  "schema_version": 1,
+  "name": "needle",
+  "token_count": 100,
+  "seed": 7,
+  "suites": [
+    {
+      "schema_version": 1,
+      "id": "needle-explicit",
+      "context": "contexts/needle_context.txt",
+      "question": "What is the archive access code?",
+      "expected": ["ORCHID-1"],
+      "grader": "Exact",
+      "metadata": {"suite": "needle", "token_count": "100"}
+    },
+    {
+      "schema_version": 1,
+      "id": "needle-auto",
+      "context": "auto",
+      "question": "What is the archive access code?",
+      "expected": ["ORCHID-1"],
+      "grader": "Exact",
+      "metadata": {"suite": "needle", "token_count": "100"}
+    }
+  ]
+}
+"#,
+        )
+        .unwrap();
+
+        let summary = dry_run_benchmarks(
+            tmp.path().to_str().unwrap(),
+            RunOptions {
+                dry_run: true,
+                filter: Some("needle-auto".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.selected_count, 1);
+        assert_eq!(summary.auto_context_count, 1);
+        assert_eq!(summary.routed_auto_context_count, 1);
+        assert!(!tmp.path().join("context.index.json").exists());
     }
 
     #[test]
@@ -1235,8 +2068,20 @@ request_style = "responses"
     #[test]
     fn load_context_returns_inline_for_missing_file() {
         let tmp = tempdir().unwrap();
-        let content = load_context(tmp.path(), "some inline text").unwrap();
-        assert_eq!(content, "some inline text");
+        let content = load_context(tmp.path(), "some inline text\nwith newline").unwrap();
+        assert_eq!(content, "some inline text\nwith newline");
+    }
+
+    #[test]
+    fn load_context_rejects_files_outside_bench_dir() {
+        let tmp = tempdir().unwrap();
+        let bench = tmp.path().join("bench");
+        fs::create_dir_all(&bench).unwrap();
+        let outside = tmp.path().join("secret.txt");
+        fs::write(&outside, "do not send").unwrap();
+
+        let error = load_context(&bench, "../secret.txt").unwrap_err();
+        assert!(error.to_string().contains("benchmark directory"));
     }
 
     #[test]
@@ -1340,5 +2185,456 @@ request_style = "responses"
 
         assert_eq!(result.answer, "ok");
         assert_eq!(result.attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn run_all_writes_and_flushes_completed_results_before_slow_tasks_finish() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("fast question"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "FAST"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 1}
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("slow question"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(5_000))
+                    .set_body_json(serde_json::json!({
+                        "choices": [{"message": {"role": "assistant", "content": "SLOW"}}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 1}
+                    })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("contexts")).unwrap();
+        fs::write(tmp.path().join("contexts/fast.txt"), "fast context").unwrap();
+        fs::write(tmp.path().join("contexts/slow.txt"), "slow context").unwrap();
+        let results_path = tmp.path().join("results.jsonl");
+        let tests = vec![
+            TestCase {
+                schema_version: SCHEMA_VERSION,
+                id: "slow".to_string(),
+                context: "contexts/slow.txt".to_string(),
+                question: "slow question".to_string(),
+                expected: vec!["SLOW".to_string()],
+                grader: crate::benchmark::Grader::Exact,
+                metadata: BTreeMap::new(),
+            },
+            TestCase {
+                schema_version: SCHEMA_VERSION,
+                id: "fast".to_string(),
+                context: "contexts/fast.txt".to_string(),
+                question: "fast question".to_string(),
+                expected: vec!["FAST".to_string()],
+                grader: crate::benchmark::Grader::Exact,
+                metadata: BTreeMap::new(),
+            },
+        ];
+        let client = Client::builder().build().unwrap();
+        let provider = ProviderConfig {
+            base_url: mock_server.uri(),
+            api_key_env: "TEST_KEY".to_string(),
+            model: "test-model".to_string(),
+            request_style: crate::benchmark::ProviderRequestStyle::ChatCompletions,
+        };
+        let run = RunConfig {
+            concurrency: 2,
+            ..Default::default()
+        };
+        let bench_path = tmp.path().to_path_buf();
+        let path_for_task = results_path.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path_for_task)
+                .unwrap();
+            let counter = TokenCounter::cl100k();
+            run_all(
+                client,
+                provider,
+                run,
+                GraderConfig::default(),
+                "test-key".to_string(),
+                bench_path,
+                tests,
+                None,
+                &counter,
+                &mut file,
+            )
+            .await
+            .unwrap()
+        });
+
+        let mut partial = String::new();
+        for _ in 0..40 {
+            partial = fs::read_to_string(&results_path).unwrap_or_default();
+            if partial.contains("\"id\":\"fast\"") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(partial.contains("\"id\":\"fast\""));
+        assert!(!partial.contains("\"id\":\"slow\""));
+
+        let results = handle.await.unwrap();
+        assert_eq!(results[0].id, "slow");
+        assert_eq!(results[1].id, "fast");
+        let final_results = fs::read_to_string(&results_path).unwrap();
+        assert!(final_results.contains("\"id\":\"slow\""));
+    }
+
+    #[tokio::test]
+    async fn run_records_llm_judge_failures_as_judge_errors() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("Use the context to answer"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "candidate answer"}}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 2}
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("You are grading an answer"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("judge unavailable"))
+            .mount(&mock_server)
+            .await;
+
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("contexts")).unwrap();
+        fs::create_dir_all(tmp.path().join("manifests")).unwrap();
+        fs::write(tmp.path().join("contexts/test.txt"), "context").unwrap();
+        fs::write(
+            tmp.path().join("config.toml"),
+            format!(
+                r#"
+[provider]
+base_url = "{}"
+api_key_env = "LONGCTX_JUDGE_TEST_KEY"
+model = "test-model"
+"#,
+                mock_server.uri()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("manifests/judge.json"),
+            r#"
+{
+  "schema_version": 1,
+  "name": "judge",
+  "token_count": 100,
+  "seed": 7,
+  "suites": [{
+    "schema_version": 1,
+    "id": "judge-1",
+    "context": "contexts/test.txt",
+    "question": "q",
+    "expected": ["a"],
+    "grader": "LlmJudge",
+    "metadata": {"suite": "judge", "token_count": "100"}
+  }]
+}
+"#,
+        )
+        .unwrap();
+        std::env::set_var("LONGCTX_JUDGE_TEST_KEY", "test-key");
+
+        run_benchmarks_with_options(
+            tmp.path().to_str().unwrap(),
+            RunOptions {
+                force: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let result_line = fs::read_to_string(tmp.path().join("results.jsonl")).unwrap();
+        let result: BenchmarkResult = serde_json::from_str(&result_line).unwrap();
+        assert_eq!(result.error_kind, Some(ErrorKind::Judge));
+        assert_eq!(result.judge_http_status, Some(500));
+        assert_eq!(result.judge_attempts, Some(3));
+        assert!(result
+            .judge_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("judge unavailable"));
+        assert!(result.error.unwrap().contains("LLM judge failed"));
+    }
+
+    #[tokio::test]
+    async fn run_retries_llm_judge_failures_then_passes() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("Use the context to answer"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "candidate answer"}}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 2}
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("You are grading an answer"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("judge unavailable"))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("You are grading an answer"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "CORRECT"}}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 1}
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("contexts")).unwrap();
+        fs::create_dir_all(tmp.path().join("manifests")).unwrap();
+        fs::write(tmp.path().join("contexts/test.txt"), "context").unwrap();
+        fs::write(
+            tmp.path().join("config.toml"),
+            format!(
+                r#"
+[provider]
+base_url = "{}"
+api_key_env = "LONGCTX_JUDGE_RETRY_TEST_KEY"
+model = "test-model"
+
+[run]
+max_retries = 2
+retry_backoff_ms = 1
+"#,
+                mock_server.uri()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("manifests/judge.json"),
+            r#"
+{
+  "schema_version": 1,
+  "name": "judge",
+  "token_count": 100,
+  "seed": 7,
+  "suites": [{
+    "schema_version": 1,
+    "id": "judge-1",
+    "context": "contexts/test.txt",
+    "question": "q",
+    "expected": ["candidate answer"],
+    "grader": "LlmJudge",
+    "metadata": {"suite": "judge", "token_count": "100"}
+  }]
+}
+"#,
+        )
+        .unwrap();
+        std::env::set_var("LONGCTX_JUDGE_RETRY_TEST_KEY", "test-key");
+
+        run_benchmarks_with_options(
+            tmp.path().to_str().unwrap(),
+            RunOptions {
+                force: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let result_line = fs::read_to_string(tmp.path().join("results.jsonl")).unwrap();
+        let result: BenchmarkResult = serde_json::from_str(&result_line).unwrap();
+        assert!(result.passed);
+        assert_eq!(result.judge_attempts, Some(2));
+        assert_eq!(result.judge_http_status, Some(200));
+        assert_eq!(result.judge_error, None);
+    }
+
+    #[tokio::test]
+    async fn run_uses_responses_style_for_llm_judge_when_configured() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(body_string_contains("Use the context to answer"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output_text": "candidate answer",
+                "usage": {"input_tokens": 20, "output_tokens": 2}
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(body_string_contains("You are grading an answer"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output_text": "CORRECT",
+                "usage": {"input_tokens": 10, "output_tokens": 1}
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("contexts")).unwrap();
+        fs::create_dir_all(tmp.path().join("manifests")).unwrap();
+        fs::write(tmp.path().join("contexts/test.txt"), "context").unwrap();
+        fs::write(
+            tmp.path().join("config.toml"),
+            format!(
+                r#"
+[provider]
+base_url = "{}"
+api_key_env = "LONGCTX_JUDGE_RESPONSES_TEST_KEY"
+model = "test-model"
+request_style = "responses"
+"#,
+                mock_server.uri()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("manifests/judge.json"),
+            r#"
+{
+  "schema_version": 1,
+  "name": "judge",
+  "token_count": 100,
+  "seed": 7,
+  "suites": [{
+    "schema_version": 1,
+    "id": "judge-1",
+    "context": "contexts/test.txt",
+    "question": "q",
+    "expected": ["candidate answer"],
+    "grader": "LlmJudge",
+    "metadata": {"suite": "judge", "token_count": "100"}
+  }]
+}
+"#,
+        )
+        .unwrap();
+        std::env::set_var("LONGCTX_JUDGE_RESPONSES_TEST_KEY", "test-key");
+
+        run_benchmarks_with_options(
+            tmp.path().to_str().unwrap(),
+            RunOptions {
+                force: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let result_line = fs::read_to_string(tmp.path().join("results.jsonl")).unwrap();
+        let result: BenchmarkResult = serde_json::from_str(&result_line).unwrap();
+        assert!(result.passed);
+        assert_eq!(result.judge_http_status, Some(200));
+        assert_eq!(result.judge_attempts, Some(1));
+        assert_eq!(result.judge_input_tokens, Some(10));
+        assert_eq!(result.judge_output_tokens, Some(1));
+    }
+
+    #[tokio::test]
+    async fn run_preflight_rejects_stale_context_index_before_provider_request() {
+        let tmp = tempdir().unwrap();
+        fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[provider]
+base_url = "http://127.0.0.1:9/v1"
+api_key_env = "LONGCTX_PREFLIGHT_KEY"
+model = "test-model"
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("contexts")).unwrap();
+        fs::create_dir_all(tmp.path().join("manifests")).unwrap();
+        fs::write(tmp.path().join("contexts/needle_context.txt"), "changed").unwrap();
+        fs::write(
+            tmp.path().join("manifests/needle.json"),
+            r#"
+{
+  "schema_version": 1,
+  "name": "needle",
+  "token_count": 100,
+  "seed": 7,
+  "suites": [{
+    "schema_version": 1,
+    "id": "needle-auto",
+    "context": "auto",
+    "question": "q",
+    "expected": ["a"],
+    "grader": "Exact",
+    "metadata": {"suite": "needle", "token_count": "100"}
+  }]
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("context.index.json"),
+            r#"{
+  "schema_version": 1,
+  "bench_id": "bench",
+  "created_at_unix_ms": 1,
+  "contexts": [{
+    "context_id": "needle_context",
+    "path": "contexts/needle_context.txt",
+    "sha256": "not-the-current-hash",
+    "suite": "needle",
+    "token_count": 100,
+    "seed": 7,
+    "source_manifests": ["manifests/needle.json"],
+    "test_ids": ["needle-auto"],
+    "title": "needle context",
+    "summary": "needle",
+    "keywords": ["needle"],
+    "safe_anchors": [],
+    "metadata": {}
+  }]
+}
+"#,
+        )
+        .unwrap();
+        std::env::set_var("LONGCTX_PREFLIGHT_KEY", "test-key");
+
+        let error = run_benchmarks_with_options(
+            tmp.path().to_str().unwrap(),
+            RunOptions {
+                force: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("hash mismatch"));
+        assert!(!tmp.path().join("results.jsonl").exists());
     }
 }

@@ -1,6 +1,7 @@
-use crate::benchmark::{Grader, TestCase};
+use crate::benchmark::{Grader, ProviderRequestStyle, TestCase};
 use crate::tokenizer::TokenCounter;
 use regex::Regex;
+use std::time::{Duration, Instant};
 
 pub fn grade(answer: &str, test: &TestCase) -> bool {
     let answer = answer.trim();
@@ -131,6 +132,10 @@ pub struct LlmJudgeResult {
     pub passed: bool,
     pub latency_ms: u64,
     pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub http_status: Option<u16>,
+    pub attempts: u32,
+    pub error: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -142,6 +147,10 @@ pub async fn grade_with_llm(
     base_url: &str,
     api_key: &str,
     model: &str,
+    request_style: ProviderRequestStyle,
+    timeout_secs: u64,
+    max_retries: u32,
+    retry_backoff_ms: u64,
     counter: &TokenCounter,
 ) -> LlmJudgeResult {
     let expected = test.expected.join(", ");
@@ -156,56 +165,185 @@ pub async fn grade_with_llm(
     );
 
     let input_tokens = counter.count_tokens(&prompt);
-    let started = std::time::Instant::now();
+    let started = Instant::now();
 
-    let body = serde_json::json!({
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.0,
-    });
+    let (url, body) = match request_style {
+        ProviderRequestStyle::ChatCompletions => (
+            format!("{}/chat/completions", base_url.trim_end_matches('/')),
+            serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0,
+            }),
+        ),
+        ProviderRequestStyle::Responses => (
+            format!("{}/responses", base_url.trim_end_matches('/')),
+            serde_json::json!({
+                "model": model,
+                "input": prompt,
+                "temperature": 0.0,
+            }),
+        ),
+    };
+    let max_attempts = max_retries.saturating_add(1).max(1);
+    let mut attempts = 0;
 
-    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-    let Ok(resp) = client
-        .post(&url)
-        .bearer_auth(api_key)
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(120))
-        .send()
-        .await
-    else {
-        return LlmJudgeResult {
-            passed: false,
-            latency_ms: started.elapsed().as_millis() as u64,
-            input_tokens,
-        };
+    let resp = loop {
+        attempts += 1;
+        match client
+            .post(&url)
+            .bearer_auth(api_key)
+            .json(&body)
+            .timeout(Duration::from_secs(timeout_secs))
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    if is_retryable_status(status) && attempts < max_attempts {
+                        tokio::time::sleep(retry_delay(retry_backoff_ms, attempts)).await;
+                        continue;
+                    }
+                    return LlmJudgeResult {
+                        passed: false,
+                        latency_ms: started.elapsed().as_millis() as u64,
+                        input_tokens,
+                        output_tokens: 0,
+                        http_status: Some(status.as_u16()),
+                        attempts,
+                        error: Some(format!("HTTP {status} from judge: {}", body.trim())),
+                    };
+                }
+                break resp;
+            }
+            Err(error) => {
+                if is_retryable_error(&error) && attempts < max_attempts {
+                    tokio::time::sleep(retry_delay(retry_backoff_ms, attempts)).await;
+                    continue;
+                }
+                return LlmJudgeResult {
+                    passed: false,
+                    latency_ms: started.elapsed().as_millis() as u64,
+                    input_tokens,
+                    output_tokens: 0,
+                    http_status: None,
+                    attempts,
+                    error: Some(error.to_string()),
+                };
+            }
+        }
     };
 
     let latency_ms = started.elapsed().as_millis() as u64;
+    let status = resp.status();
+    let http_status = Some(status.as_u16());
 
     let Ok(json) = resp.json::<serde_json::Value>().await else {
         return LlmJudgeResult {
             passed: false,
             latency_ms,
             input_tokens,
+            output_tokens: 0,
+            http_status,
+            attempts,
+            error: Some("failed to decode judge response JSON".to_string()),
         };
     };
 
-    let judge_answer = json
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
+    let judge_answer = match request_style {
+        ProviderRequestStyle::ChatCompletions => json
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string(),
+        ProviderRequestStyle::Responses => responses_answer_from_value(&json).unwrap_or_default(),
+    };
 
     let upper = judge_answer.to_uppercase();
     let passed = upper.contains("CORRECT") && !upper.contains("INCORRECT");
+    let input_tokens = json
+        .get("usage")
+        .and_then(|usage| match request_style {
+            ProviderRequestStyle::ChatCompletions => usage.get("prompt_tokens"),
+            ProviderRequestStyle::Responses => usage.get("input_tokens"),
+        })
+        .and_then(|tokens| tokens.as_u64())
+        .unwrap_or(input_tokens);
+    let output_tokens = json
+        .get("usage")
+        .and_then(|usage| match request_style {
+            ProviderRequestStyle::ChatCompletions => usage.get("completion_tokens"),
+            ProviderRequestStyle::Responses => usage.get("output_tokens"),
+        })
+        .and_then(|tokens| tokens.as_u64())
+        .unwrap_or_else(|| counter.count_tokens(&judge_answer));
 
     LlmJudgeResult {
         passed,
         latency_ms,
         input_tokens,
+        output_tokens,
+        http_status,
+        attempts,
+        error: None,
     }
+}
+
+fn responses_answer_from_value(json: &serde_json::Value) -> Option<String> {
+    if let Some(text) = json
+        .get("output_text")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(text.to_string());
+    }
+    json.get("output")
+        .and_then(|output| output.as_array())
+        .and_then(|items| {
+            items
+                .iter()
+                .flat_map(|item| {
+                    item.get("content")
+                        .and_then(|content| content.as_array())
+                        .into_iter()
+                        .flatten()
+                })
+                .find_map(|content| {
+                    content
+                        .get("text")
+                        .and_then(|text| text.as_str())
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .map(str::to_string)
+                })
+        })
+}
+
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::REQUEST_TIMEOUT
+            | reqwest::StatusCode::TOO_MANY_REQUESTS
+            | reqwest::StatusCode::INTERNAL_SERVER_ERROR
+            | reqwest::StatusCode::BAD_GATEWAY
+            | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            | reqwest::StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+fn is_retryable_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect() || error.is_request()
+}
+
+fn retry_delay(retry_backoff_ms: u64, attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(10);
+    Duration::from_millis(retry_backoff_ms.saturating_mul(1u64 << shift))
 }
 
 #[cfg(test)]
