@@ -35,6 +35,7 @@ pub enum ErrorKind {
     Transport,
     Http,
     ResponseDecode,
+    Judge,
     Validation,
 }
 
@@ -108,6 +109,14 @@ pub struct BenchmarkResult {
     pub judge_latency_ms: Option<u64>,
     #[serde(default)]
     pub judge_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub judge_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub judge_http_status: Option<u16>,
+    #[serde(default)]
+    pub judge_attempts: Option<u32>,
+    #[serde(default)]
+    pub judge_error: Option<String>,
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
 }
@@ -282,6 +291,10 @@ mod tests {
             routing: None,
             judge_latency_ms: None,
             judge_input_tokens: None,
+            judge_output_tokens: None,
+            judge_http_status: None,
+            judge_attempts: None,
+            judge_error: None,
             metadata: BTreeMap::new(),
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -342,6 +355,7 @@ mod tests {
             ErrorKind::Transport,
             ErrorKind::Http,
             ErrorKind::ResponseDecode,
+            ErrorKind::Judge,
             ErrorKind::Validation,
         ];
         for kind in &kinds {

@@ -365,6 +365,10 @@ async fn run_one(
                 routing,
                 judge_latency_ms: None,
                 judge_input_tokens: None,
+                judge_output_tokens: None,
+                judge_http_status: None,
+                judge_attempts: None,
+                judge_error: None,
                 metadata: test.metadata.clone(),
             };
         }
@@ -394,6 +398,10 @@ async fn run_one(
                 routing,
                 judge_latency_ms: None,
                 judge_input_tokens: None,
+                judge_output_tokens: None,
+                judge_http_status: None,
+                judge_attempts: None,
+                judge_error: None,
                 metadata: test.metadata.clone(),
             };
         }
@@ -430,31 +438,52 @@ async fn run_one(
 
     match response {
         Ok(output) => {
-            let (passed, judge_lat, judge_tok) =
-                if matches!(test.grader, crate::benchmark::Grader::LlmJudge) {
-                    let judge_model = grader_config
-                        .judge_model
-                        .as_deref()
-                        .unwrap_or(&provider.model);
-                    let judge_result = grade_with_llm(
-                        &output.answer,
-                        test,
-                        &context,
-                        client,
-                        &provider.base_url,
-                        api_key,
-                        judge_model,
-                        counter,
-                    )
-                    .await;
-                    (
-                        judge_result.passed,
-                        Some(judge_result.latency_ms),
-                        Some(judge_result.input_tokens),
-                    )
-                } else {
-                    (grade(&output.answer, test), None, None)
-                };
+            let (
+                passed,
+                judge_lat,
+                judge_input_tok,
+                judge_output_tok,
+                judge_http_status,
+                judge_attempts,
+                judge_error,
+            ) = if matches!(test.grader, crate::benchmark::Grader::LlmJudge) {
+                let judge_model = grader_config
+                    .judge_model
+                    .as_deref()
+                    .unwrap_or(&provider.model);
+                let judge_result = grade_with_llm(
+                    &output.answer,
+                    test,
+                    &context,
+                    client,
+                    &provider.base_url,
+                    api_key,
+                    judge_model,
+                    run.request_timeout_secs,
+                    counter,
+                )
+                .await;
+                (
+                    judge_result.passed,
+                    Some(judge_result.latency_ms),
+                    Some(judge_result.input_tokens),
+                    Some(judge_result.output_tokens),
+                    judge_result.http_status,
+                    Some(judge_result.attempts),
+                    judge_result.error,
+                )
+            } else {
+                (
+                    grade(&output.answer, test),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            };
+            let judge_failed = judge_error.is_some();
             BenchmarkResult {
                 schema_version: SCHEMA_VERSION,
                 suite: suite_name(test),
@@ -474,17 +503,25 @@ async fn run_one(
                 answer: Some(output.answer),
                 error: if passed {
                     None
+                } else if let Some(error) = &judge_error {
+                    Some(format!("LLM judge failed: {error}"))
                 } else {
                     Some("answer did not satisfy grader".to_string())
                 },
                 error_kind: if passed {
                     None
+                } else if judge_failed {
+                    Some(ErrorKind::Judge)
                 } else {
                     Some(ErrorKind::Validation)
                 },
                 routing,
                 judge_latency_ms: judge_lat,
-                judge_input_tokens: judge_tok,
+                judge_input_tokens: judge_input_tok,
+                judge_output_tokens: judge_output_tok,
+                judge_http_status,
+                judge_attempts,
+                judge_error,
                 metadata: test.metadata.clone(),
             }
         }
@@ -795,6 +832,10 @@ fn error_result<E: std::fmt::Display>(input: ErrorResultInput<'_, E>) -> Benchma
         routing: input.routing,
         judge_latency_ms: None,
         judge_input_tokens: None,
+        judge_output_tokens: None,
+        judge_http_status: None,
+        judge_attempts: None,
+        judge_error: None,
         metadata: input.test.metadata.clone(),
     }
 }
@@ -1368,6 +1409,10 @@ request_style = "responses"
             routing: None,
             judge_latency_ms: None,
             judge_input_tokens: None,
+            judge_output_tokens: None,
+            judge_http_status: None,
+            judge_attempts: None,
+            judge_error: None,
             metadata: BTreeMap::new(),
         };
         let log_path = tmp.path().join("reports/http-log.jsonl");
@@ -1429,6 +1474,10 @@ request_style = "responses"
             }),
             judge_latency_ms: None,
             judge_input_tokens: None,
+            judge_output_tokens: None,
+            judge_http_status: None,
+            judge_attempts: None,
+            judge_error: None,
             metadata: BTreeMap::new(),
         };
         let log_path = tmp.path().join("reports/http-log.jsonl");
@@ -1602,6 +1651,85 @@ request_style = "responses"
 
         assert_eq!(result.answer, "ok");
         assert_eq!(result.attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn run_records_llm_judge_failures_as_judge_errors() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("Use the context to answer"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "candidate answer"}}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 2}
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("You are grading an answer"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("judge unavailable"))
+            .mount(&mock_server)
+            .await;
+
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("contexts")).unwrap();
+        fs::create_dir_all(tmp.path().join("manifests")).unwrap();
+        fs::write(tmp.path().join("contexts/test.txt"), "context").unwrap();
+        fs::write(
+            tmp.path().join("config.toml"),
+            format!(
+                r#"
+[provider]
+base_url = "{}"
+api_key_env = "LONGCTX_JUDGE_TEST_KEY"
+model = "test-model"
+"#,
+                mock_server.uri()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("manifests/judge.json"),
+            r#"
+{
+  "schema_version": 1,
+  "name": "judge",
+  "token_count": 100,
+  "seed": 7,
+  "suites": [{
+    "schema_version": 1,
+    "id": "judge-1",
+    "context": "contexts/test.txt",
+    "question": "q",
+    "expected": ["a"],
+    "grader": "LlmJudge",
+    "metadata": {"suite": "judge", "token_count": "100"}
+  }]
+}
+"#,
+        )
+        .unwrap();
+        std::env::set_var("LONGCTX_JUDGE_TEST_KEY", "test-key");
+
+        run_benchmarks_with_options(tmp.path().to_str().unwrap(), RunOptions { force: false })
+            .await
+            .unwrap();
+
+        let result_line = fs::read_to_string(tmp.path().join("results.jsonl")).unwrap();
+        let result: BenchmarkResult = serde_json::from_str(&result_line).unwrap();
+        assert_eq!(result.error_kind, Some(ErrorKind::Judge));
+        assert_eq!(result.judge_http_status, Some(500));
+        assert_eq!(result.judge_attempts, Some(1));
+        assert!(result
+            .judge_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("judge unavailable"));
+        assert!(result.error.unwrap().contains("LLM judge failed"));
     }
 
     #[tokio::test]

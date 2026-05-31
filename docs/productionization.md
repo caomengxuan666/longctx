@@ -39,6 +39,7 @@ The next work should make the loop dependable enough for repeat use.
 - Run preflight validation, duplicate test ID rejection, and output overwrite protection.
 - Runtime context index validation for stale hashes and path escape attempts.
 - Result reader guards for unsupported future schema versions and duplicate comparison IDs.
+- Structured LLM judge failure reporting with judge status, attempts, token, latency, and error metadata.
 
 ## Next priorities
 

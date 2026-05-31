@@ -167,7 +167,7 @@ The config also supports an optional `[grader]` section for LLM-as-judge grading
 judge_model = "gpt-4.1-mini"  # optional, defaults to the same provider model
 ```
 
-When a test case uses `Grader::LlmJudge`, the runner sends the answer to the judge model for evaluation instead of using exact string matching.
+When a test case uses `Grader::LlmJudge`, the runner sends the answer to the judge model for evaluation instead of using exact string matching. Judge failures are reported separately with `error_kind = "Judge"` and include judge HTTP status, attempts, latency, token counts, and error text in the result row.
 
 Any provider that exposes an OpenAI-compatible `/chat/completions` endpoint can be used by changing `base_url`, `api_key_env`, and `model`.
 
@@ -180,7 +180,7 @@ Each generated suite writes:
 - A context routing index at `context.index.json`.
 
 The runner accepts generated suite manifests and writes newline-delimited JSON results to `results.jsonl`.
-Result rows include the suite name, token count, provider model, HTTP status, provider request ID, rate-limit headers, attempt count, structured error kind when a run fails, and optional routing audit details. Readers reject result rows with a newer unsupported `schema_version`, and `compare` rejects duplicate result IDs.
+Result rows include the suite name, token count, provider model, HTTP status, provider request ID, rate-limit headers, attempt count, structured error kind when a run fails, optional judge audit details, and optional routing audit details. Readers reject result rows with a newer unsupported `schema_version`, and `compare` rejects duplicate result IDs.
 Each run also writes a `run.json` snapshot with config and timing metadata.
 When `run.log_requests` is enabled, redacted HTTP exchange logs are written to `reports/http-log.jsonl`.
 

@@ -54,3 +54,9 @@ Automatic context routing:
 - Ambiguous routing and tied top candidates fail the row with `ContextRoute` so benchmark results remain auditable.
 - Each routed result stores a `routing` object with selected path, candidate scores, method, status, confidence, and router token/latency fields.
 - Existing indexes are validated during `run`; stale hashes, newer schema versions, absolute paths, and paths escaping the benchmark directory are rejected before provider requests.
+
+LLM judge auditing:
+
+- Test cases with `grader = "LlmJudge"` use the configured provider chat-completions endpoint as a judge.
+- Judge API failures are distinct from ordinary answer mismatches and set `error_kind` to `Judge`.
+- Result rows include judge HTTP status, attempts, latency, token counts, and error text when judge metadata is available.

@@ -131,6 +131,10 @@ pub struct LlmJudgeResult {
     pub passed: bool,
     pub latency_ms: u64,
     pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub http_status: Option<u16>,
+    pub attempts: u32,
+    pub error: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -142,6 +146,7 @@ pub async fn grade_with_llm(
     base_url: &str,
     api_key: &str,
     model: &str,
+    timeout_secs: u64,
     counter: &TokenCounter,
 ) -> LlmJudgeResult {
     let expected = test.expected.join(", ");
@@ -165,28 +170,53 @@ pub async fn grade_with_llm(
     });
 
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-    let Ok(resp) = client
+    let resp = match client
         .post(&url)
         .bearer_auth(api_key)
         .json(&body)
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(timeout_secs))
         .send()
         .await
-    else {
-        return LlmJudgeResult {
-            passed: false,
-            latency_ms: started.elapsed().as_millis() as u64,
-            input_tokens,
-        };
+    {
+        Ok(resp) => resp,
+        Err(error) => {
+            return LlmJudgeResult {
+                passed: false,
+                latency_ms: started.elapsed().as_millis() as u64,
+                input_tokens,
+                output_tokens: 0,
+                http_status: None,
+                attempts: 1,
+                error: Some(error.to_string()),
+            };
+        }
     };
 
     let latency_ms = started.elapsed().as_millis() as u64;
+    let status = resp.status();
+    let http_status = Some(status.as_u16());
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return LlmJudgeResult {
+            passed: false,
+            latency_ms,
+            input_tokens,
+            output_tokens: 0,
+            http_status,
+            attempts: 1,
+            error: Some(format!("HTTP {status} from judge: {}", body.trim())),
+        };
+    }
 
     let Ok(json) = resp.json::<serde_json::Value>().await else {
         return LlmJudgeResult {
             passed: false,
             latency_ms,
             input_tokens,
+            output_tokens: 0,
+            http_status,
+            attempts: 1,
+            error: Some("failed to decode judge response JSON".to_string()),
         };
     };
 
@@ -200,11 +230,20 @@ pub async fn grade_with_llm(
 
     let upper = judge_answer.to_uppercase();
     let passed = upper.contains("CORRECT") && !upper.contains("INCORRECT");
+    let output_tokens = json
+        .get("usage")
+        .and_then(|usage| usage.get("completion_tokens"))
+        .and_then(|tokens| tokens.as_u64())
+        .unwrap_or_else(|| counter.count_tokens(judge_answer));
 
     LlmJudgeResult {
         passed,
         latency_ms,
         input_tokens,
+        output_tokens,
+        http_status,
+        attempts: 1,
+        error: None,
     }
 }
 

@@ -27,6 +27,7 @@ fn docs_cover_current_cli_and_config_surface() {
     assert!(readme.contains("request_log_path"));
     assert!(readme.contains("request_style"));
     assert!(readme.contains("judge_model"));
+    assert!(readme.contains("error_kind = \"Judge\""));
     assert!(readme.contains("context = \"auto\""));
     assert!(readme.contains("context.index.json"));
     assert!(readme.contains("--force"));
@@ -39,6 +40,7 @@ fn docs_cover_current_cli_and_config_surface() {
     assert!(config.contains("reports/http-log.jsonl"));
     assert!(config.contains("context.index.json"));
     assert!(config.contains("Duplicate test IDs"));
+    assert!(config.contains("LLM judge auditing"));
 
     let roadmap = fs::read_to_string("docs/productionization.md")
         .expect("docs/productionization.md should be readable");

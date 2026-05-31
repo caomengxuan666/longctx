@@ -61,6 +61,7 @@ struct ResultRow {
     error_kind_display: String,
     routing_display: String,
     routing_context_display: String,
+    judge_display: String,
     answer_display: String,
     error_display: String,
 }
@@ -119,6 +120,7 @@ pub fn generate_html(results_path: &str, out_path: &str) -> Result<()> {
                 .as_ref()
                 .and_then(|routing| routing.selected_context_path.clone())
                 .unwrap_or_default();
+            let judge_display = render_judge_display(result);
             ResultRow {
                 id: result.id.clone(),
                 suite_display: result.suite.clone().unwrap_or_default(),
@@ -149,6 +151,7 @@ pub fn generate_html(results_path: &str, out_path: &str) -> Result<()> {
                     .unwrap_or_default(),
                 routing_display,
                 routing_context_display,
+                judge_display,
                 answer_display: result.answer.clone().unwrap_or_default(),
                 error_display: result.error.clone().unwrap_or_default(),
             }
@@ -295,6 +298,36 @@ fn render_failure_summary(results: &[BenchmarkResult]) -> Vec<FailureGroupSummar
         .collect()
 }
 
+fn render_judge_display(result: &BenchmarkResult) -> String {
+    if result.judge_latency_ms.is_none()
+        && result.judge_http_status.is_none()
+        && result.judge_error.is_none()
+    {
+        return String::new();
+    }
+
+    let mut parts = Vec::new();
+    if let Some(status) = result.judge_http_status {
+        parts.push(format!("HTTP {status}"));
+    }
+    if let Some(attempts) = result.judge_attempts {
+        parts.push(format!("{attempts} attempt(s)"));
+    }
+    if let Some(latency) = result.judge_latency_ms {
+        parts.push(format!("{latency} ms"));
+    }
+    if let Some(input_tokens) = result.judge_input_tokens {
+        parts.push(format!("{input_tokens} in"));
+    }
+    if let Some(output_tokens) = result.judge_output_tokens {
+        parts.push(format!("{output_tokens} out"));
+    }
+    if let Some(error) = &result.judge_error {
+        parts.push(error.clone());
+    }
+    parts.join(" / ")
+}
+
 fn render_line_chart(values: &[f64], color: &str) -> String {
     const WIDTH: f64 = 600.0;
     const HEIGHT: f64 = 180.0;
@@ -393,6 +426,25 @@ mod tests {
         assert!(html.contains("Failure Groups"));
         assert!(html.contains("needle"));
         assert!(html.contains("Http"));
+    }
+
+    #[test]
+    fn report_includes_judge_audit_details() {
+        let tmp = tempdir().unwrap();
+        let results = tmp.path().join("results.jsonl");
+        let out = tmp.path().join("report.html");
+        fs::write(
+            &results,
+            r#"{"schema_version":1,"suite":"judge","token_count":100,"id":"judge-1","provider_model":"gpt-4.1","provider_base_url":"https://api.openai.com/v1","http_status":200,"request_id":"req_1","passed":false,"attempts":1,"latency_ms":10,"input_tokens":100,"output_tokens":5,"answer":"A","error":"LLM judge failed: HTTP 500","error_kind":"Judge","judge_latency_ms":7,"judge_input_tokens":20,"judge_output_tokens":0,"judge_http_status":500,"judge_attempts":1,"judge_error":"HTTP 500 from judge"}
+"#,
+        )
+        .unwrap();
+
+        generate_html(results.to_str().unwrap(), out.to_str().unwrap()).unwrap();
+        let html = fs::read_to_string(out).unwrap();
+        assert!(html.contains("Judge"));
+        assert!(html.contains("HTTP 500"));
+        assert!(html.contains("HTTP 500 from judge"));
     }
 
     #[test]
@@ -507,6 +559,10 @@ mod tests {
             routing: None,
             judge_latency_ms: None,
             judge_input_tokens: None,
+            judge_output_tokens: None,
+            judge_http_status: None,
+            judge_attempts: None,
+            judge_error: None,
             metadata: BTreeMap::new(),
         };
         assert_eq!(failure_group(&result), "Http");
