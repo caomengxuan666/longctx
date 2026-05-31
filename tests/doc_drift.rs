@@ -3,7 +3,7 @@ use std::fs;
 #[test]
 fn docs_cover_current_cli_and_config_surface() {
     let cargo_toml = fs::read_to_string("Cargo.toml").expect("Cargo.toml should be readable");
-    assert!(cargo_toml.contains("rust-version = \"1.81\""));
+    assert!(cargo_toml.contains("rust-version = \"1.86\""));
     assert!(cargo_toml.contains("\"/report.html\""));
     assert!(cargo_toml.contains("\".codex.toml\""));
 
@@ -44,7 +44,7 @@ fn docs_cover_current_cli_and_config_surface() {
     assert!(readme.contains("same retry, backoff, and timeout"));
     assert!(readme.contains("configured provider request style"));
     assert!(readme.contains("reports/report.html"));
-    assert!(readme.contains("Minimum supported Rust version: 1.81"));
+    assert!(readme.contains("Minimum supported Rust version: 1.86"));
     assert!(readme.contains("cargo install longctx"));
     assert!(readme.contains("SHA256"));
 
@@ -72,7 +72,7 @@ fn docs_cover_current_cli_and_config_surface() {
     assert!(roadmap.contains("schema_version"));
     assert!(roadmap.contains("request IDs"));
     assert!(roadmap.contains("license"));
-    assert!(roadmap.contains("MSRV 1.81"));
+    assert!(roadmap.contains("MSRV 1.86"));
     assert!(roadmap.contains("Durable result writes"));
     assert!(roadmap.contains("artifact fingerprints"));
 }

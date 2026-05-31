@@ -8,7 +8,7 @@ Design and configuration notes live in [docs/configuration.md](docs/configuratio
 
 ## Install
 
-Minimum supported Rust version: 1.81.
+Minimum supported Rust version: 1.86.
 
 ```sh
 cargo install --git https://github.com/LibSkills/longctx.git

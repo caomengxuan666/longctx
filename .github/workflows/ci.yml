@@ -40,15 +40,15 @@ jobs:
         run: cargo package --locked --allow-dirty
 
   msrv:
-    name: MSRV 1.81
+    name: MSRV 1.86
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust 1.81
-        uses: dtolnay/rust-toolchain@1.81
+      - name: Install Rust 1.86
+        uses: dtolnay/rust-toolchain@1.86
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
