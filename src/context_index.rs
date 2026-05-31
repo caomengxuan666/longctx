@@ -59,6 +59,14 @@ pub fn load_or_build_context_index(bench_dir: &Path) -> Result<ContextIndex> {
     Ok(index)
 }
 
+pub fn load_or_build_context_index_in_memory(bench_dir: &Path) -> Result<ContextIndex> {
+    let index_path = bench_dir.join(CONTEXT_INDEX_FILE);
+    if index_path.exists() {
+        return read_context_index(&index_path);
+    }
+    build_context_index(bench_dir)
+}
+
 pub fn read_context_index(path: &Path) -> Result<ContextIndex> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("failed to read context index {}", path.display()))?;

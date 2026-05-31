@@ -31,6 +31,8 @@ fn docs_cover_current_cli_and_config_surface() {
     assert!(readme.contains("context = \"auto\""));
     assert!(readme.contains("context.index.json"));
     assert!(readme.contains("--force"));
+    assert!(readme.contains("--dry-run"));
+    assert!(readme.contains("--filter"));
 
     let config = fs::read_to_string("docs/configuration.md")
         .expect("docs/configuration.md should be readable");
@@ -41,6 +43,7 @@ fn docs_cover_current_cli_and_config_surface() {
     assert!(config.contains("context.index.json"));
     assert!(config.contains("Duplicate test IDs"));
     assert!(config.contains("LLM judge auditing"));
+    assert!(config.contains("--limit"));
 
     let roadmap = fs::read_to_string("docs/productionization.md")
         .expect("docs/productionization.md should be readable");

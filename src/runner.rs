@@ -3,12 +3,12 @@ use crate::benchmark::{
     RunMetadata, SuiteManifest, TestCase, SCHEMA_VERSION,
 };
 use crate::context_index::{
-    is_auto_context, load_or_build_context_index, route_context, validate_context_index,
-    write_context_index, ContextIndex,
+    is_auto_context, load_or_build_context_index, load_or_build_context_index_in_memory,
+    route_context, validate_context_index, write_context_index, ContextIndex,
 };
 use crate::grader::{grade, grade_with_llm};
 use crate::tokenizer::TokenCounter;
-use crate::validator::validate_loaded_benchmark;
+use crate::validator::validate_loaded_benchmark_with_options;
 use anyhow::{anyhow, Context, Result};
 use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
@@ -27,19 +27,37 @@ pub async fn run_benchmarks(bench_dir: &str) -> Result<()> {
     run_benchmarks_with_options(bench_dir, RunOptions::default()).await
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct RunOptions {
     pub force: bool,
+    pub dry_run: bool,
+    pub filter: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunPlanSummary {
+    pub total_count: usize,
+    pub selected_count: usize,
+    pub auto_context_count: usize,
+    pub routed_auto_context_count: usize,
+    pub provider_model: String,
+    pub suites: Vec<String>,
 }
 
 pub async fn run_benchmarks_with_options(bench_dir: &str, options: RunOptions) -> Result<()> {
-    let bench_path = Path::new(bench_dir);
-    let config = read_config(&bench_path.join("config.toml"))?;
-    let tests = read_tests(bench_path)?;
-    if tests.is_empty() {
-        return Err(anyhow!("no benchmark .json files found in {bench_dir}"));
+    if options.dry_run {
+        dry_run_benchmarks(bench_dir, options)?;
+        return Ok(());
     }
-    validate_loaded_benchmark(bench_path, &config, &tests, false)?;
+    let bench_path = Path::new(bench_dir);
+    let prepared = prepare_benchmark_run(bench_path, &options, true)?;
+    let PreparedRun {
+        config,
+        tests,
+        context_index,
+        ..
+    } = prepared;
 
     let api_key = env::var(&config.provider.api_key_env).with_context(|| {
         format!(
@@ -47,15 +65,6 @@ pub async fn run_benchmarks_with_options(bench_dir: &str, options: RunOptions) -
             config.provider.api_key_env
         )
     })?;
-
-    let context_index = if tests.iter().any(|test| is_auto_context(&test.context)) {
-        let index = load_or_build_context_index(bench_path)?;
-        validate_context_index(bench_path, &index)?;
-        write_context_index(bench_path, &index)?;
-        Some(index)
-    } else {
-        None
-    };
 
     let results_path = bench_path.join("results.jsonl");
     let metadata_path = bench_path.join("run.json");
@@ -115,6 +124,138 @@ pub async fn run_benchmarks_with_options(bench_dir: &str, options: RunOptions) -
     write_run_metadata(&metadata_path, &metadata)?;
 
     Ok(())
+}
+
+pub fn dry_run_benchmarks(bench_dir: &str, options: RunOptions) -> Result<RunPlanSummary> {
+    let bench_path = Path::new(bench_dir);
+    let prepared = prepare_benchmark_run(bench_path, &options, false)?;
+    Ok(prepared.summary)
+}
+
+struct PreparedRun {
+    config: Config,
+    tests: Vec<TestCase>,
+    context_index: Option<ContextIndex>,
+    summary: RunPlanSummary,
+}
+
+fn prepare_benchmark_run(
+    bench_path: &Path,
+    options: &RunOptions,
+    write_missing_context_index: bool,
+) -> Result<PreparedRun> {
+    let config = read_config(&bench_path.join("config.toml"))?;
+    let all_tests = read_tests(bench_path)?;
+    if all_tests.is_empty() {
+        return Err(anyhow!(
+            "no benchmark .json files found in {}",
+            bench_path.display()
+        ));
+    }
+    let total_count = all_tests.len();
+    let tests = select_tests(all_tests, options);
+    if tests.is_empty() {
+        anyhow::bail!("no benchmark tests selected by the current run options");
+    }
+    validate_loaded_benchmark_with_options(
+        bench_path,
+        &config,
+        &tests,
+        false,
+        write_missing_context_index,
+    )?;
+
+    let context_index = if tests.iter().any(|test| is_auto_context(&test.context)) {
+        let index = if write_missing_context_index {
+            load_or_build_context_index(bench_path)?
+        } else {
+            load_or_build_context_index_in_memory(bench_path)?
+        };
+        validate_context_index(bench_path, &index)?;
+        if write_missing_context_index {
+            write_context_index(bench_path, &index)?;
+        }
+        Some(index)
+    } else {
+        None
+    };
+
+    let auto_context_count = tests
+        .iter()
+        .filter(|test| is_auto_context(&test.context))
+        .count();
+    let routed_auto_context_count =
+        validate_auto_routing(&tests, context_index.as_ref(), options.dry_run)?;
+    let summary = RunPlanSummary {
+        total_count,
+        selected_count: tests.len(),
+        auto_context_count,
+        routed_auto_context_count,
+        provider_model: config.provider.model.clone(),
+        suites: suite_names(&tests),
+    };
+
+    Ok(PreparedRun {
+        config,
+        tests,
+        context_index,
+        summary,
+    })
+}
+
+fn select_tests(tests: Vec<TestCase>, options: &RunOptions) -> Vec<TestCase> {
+    let mut selected = if let Some(filter) = options.filter.as_deref() {
+        let filter = filter.to_ascii_lowercase();
+        tests
+            .into_iter()
+            .filter(|test| test_matches_filter(test, &filter))
+            .collect::<Vec<_>>()
+    } else {
+        tests
+    };
+
+    if let Some(limit) = options.limit {
+        selected.truncate(limit);
+    }
+    selected
+}
+
+fn test_matches_filter(test: &TestCase, filter: &str) -> bool {
+    test.id.to_ascii_lowercase().contains(filter)
+        || test
+            .metadata
+            .get("suite")
+            .map(|suite| suite.to_ascii_lowercase().contains(filter))
+            .unwrap_or(false)
+}
+
+fn validate_auto_routing(
+    tests: &[TestCase],
+    context_index: Option<&ContextIndex>,
+    fail_on_error: bool,
+) -> Result<usize> {
+    let mut routed = 0;
+    for test in tests.iter().filter(|test| is_auto_context(&test.context)) {
+        let Some(index) = context_index else {
+            anyhow::bail!("context routing requested but context index is unavailable");
+        };
+        let decision = route_context(test, index);
+        if decision.selected_context_path.is_none() {
+            if fail_on_error {
+                anyhow::bail!(
+                    "context routing failed for {}: {}",
+                    test.id,
+                    decision
+                        .reason
+                        .as_deref()
+                        .unwrap_or("no context candidate selected")
+                );
+            }
+            continue;
+        }
+        routed += 1;
+    }
+    Ok(routed)
 }
 
 fn ensure_output_paths_can_be_written(
@@ -1501,6 +1642,143 @@ request_style = "responses"
     }
 
     #[test]
+    fn dry_run_applies_filter_and_limit_without_api_key_or_outputs() {
+        let tmp = tempdir().unwrap();
+        fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[provider]
+base_url = "https://api.example.test/v1"
+api_key_env = "MISSING_DRY_RUN_KEY"
+model = "example-model"
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("contexts")).unwrap();
+        fs::create_dir_all(tmp.path().join("manifests")).unwrap();
+        fs::write(tmp.path().join("contexts/test.txt"), "context").unwrap();
+        fs::write(
+            tmp.path().join("manifests/needle.json"),
+            r#"
+{
+  "schema_version": 1,
+  "name": "needle",
+  "token_count": 100,
+  "seed": 7,
+  "suites": [
+    {
+      "schema_version": 1,
+      "id": "needle-a",
+      "context": "contexts/test.txt",
+      "question": "q",
+      "expected": ["a"],
+      "grader": "Exact",
+      "metadata": {"suite": "needle"}
+    },
+    {
+      "schema_version": 1,
+      "id": "needle-b",
+      "context": "contexts/test.txt",
+      "question": "q",
+      "expected": ["b"],
+      "grader": "Exact",
+      "metadata": {"suite": "needle"}
+    }
+  ]
+}
+"#,
+        )
+        .unwrap();
+
+        let summary = dry_run_benchmarks(
+            tmp.path().to_str().unwrap(),
+            RunOptions {
+                dry_run: true,
+                filter: Some("needle".to_string()),
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.total_count, 2);
+        assert_eq!(summary.selected_count, 1);
+        assert_eq!(summary.provider_model, "example-model");
+        assert_eq!(summary.suites, vec!["needle"]);
+        assert!(!tmp.path().join("results.jsonl").exists());
+        assert!(!tmp.path().join("run.json").exists());
+    }
+
+    #[test]
+    fn dry_run_resolves_auto_context_without_writing_index() {
+        let tmp = tempdir().unwrap();
+        fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[provider]
+base_url = "https://api.example.test/v1"
+api_key_env = "MISSING_DRY_RUN_KEY"
+model = "example-model"
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("contexts")).unwrap();
+        fs::create_dir_all(tmp.path().join("manifests")).unwrap();
+        fs::write(
+            tmp.path().join("contexts/needle_context.txt"),
+            "Needle fact: the archive access code is ORCHID-1.",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("manifests/needle.json"),
+            r#"
+{
+  "schema_version": 1,
+  "name": "needle",
+  "token_count": 100,
+  "seed": 7,
+  "suites": [
+    {
+      "schema_version": 1,
+      "id": "needle-explicit",
+      "context": "contexts/needle_context.txt",
+      "question": "What is the archive access code?",
+      "expected": ["ORCHID-1"],
+      "grader": "Exact",
+      "metadata": {"suite": "needle", "token_count": "100"}
+    },
+    {
+      "schema_version": 1,
+      "id": "needle-auto",
+      "context": "auto",
+      "question": "What is the archive access code?",
+      "expected": ["ORCHID-1"],
+      "grader": "Exact",
+      "metadata": {"suite": "needle", "token_count": "100"}
+    }
+  ]
+}
+"#,
+        )
+        .unwrap();
+
+        let summary = dry_run_benchmarks(
+            tmp.path().to_str().unwrap(),
+            RunOptions {
+                dry_run: true,
+                filter: Some("needle-auto".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.selected_count, 1);
+        assert_eq!(summary.auto_context_count, 1);
+        assert_eq!(summary.routed_auto_context_count, 1);
+        assert!(!tmp.path().join("context.index.json").exists());
+    }
+
+    #[test]
     fn retry_delay_exponentiates() {
         let run = RunConfig {
             retry_backoff_ms: 100,
@@ -1715,9 +1993,15 @@ model = "test-model"
         .unwrap();
         std::env::set_var("LONGCTX_JUDGE_TEST_KEY", "test-key");
 
-        run_benchmarks_with_options(tmp.path().to_str().unwrap(), RunOptions { force: false })
-            .await
-            .unwrap();
+        run_benchmarks_with_options(
+            tmp.path().to_str().unwrap(),
+            RunOptions {
+                force: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
         let result_line = fs::read_to_string(tmp.path().join("results.jsonl")).unwrap();
         let result: BenchmarkResult = serde_json::from_str(&result_line).unwrap();
@@ -1796,10 +2080,15 @@ model = "test-model"
         .unwrap();
         std::env::set_var("LONGCTX_PREFLIGHT_KEY", "test-key");
 
-        let error =
-            run_benchmarks_with_options(tmp.path().to_str().unwrap(), RunOptions { force: false })
-                .await
-                .unwrap_err();
+        let error = run_benchmarks_with_options(
+            tmp.path().to_str().unwrap(),
+            RunOptions {
+                force: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("hash mismatch"));
         assert!(!tmp.path().join("results.jsonl").exists());
     }

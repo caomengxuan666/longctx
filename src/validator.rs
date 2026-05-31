@@ -1,7 +1,7 @@
 use crate::benchmark::{Config, Grader, TestCase, SCHEMA_VERSION};
 use crate::context_index::{
-    is_auto_context, load_or_build_context_index, read_context_index, validate_context_index,
-    CONTEXT_INDEX_FILE,
+    is_auto_context, load_or_build_context_index, load_or_build_context_index_in_memory,
+    read_context_index, validate_context_index, CONTEXT_INDEX_FILE,
 };
 use crate::runner::{read_config, read_tests};
 use anyhow::{bail, Context, Result};
@@ -45,13 +45,27 @@ pub(crate) fn validate_loaded_benchmark(
     tests: &[TestCase],
     check_api_key: bool,
 ) -> Result<()> {
+    validate_loaded_benchmark_with_options(bench_path, config, tests, check_api_key, true)
+}
+
+pub(crate) fn validate_loaded_benchmark_with_options(
+    bench_path: &Path,
+    config: &Config,
+    tests: &[TestCase],
+    check_api_key: bool,
+    write_missing_context_index: bool,
+) -> Result<()> {
     validate_config(config, check_api_key)?;
     validate_unique_test_ids(tests)?;
     for test in tests {
         validate_test(bench_path, test)?;
     }
     if tests.iter().any(|test| is_auto_context(&test.context)) {
-        let index = load_or_build_context_index(bench_path)?;
+        let index = if write_missing_context_index {
+            load_or_build_context_index(bench_path)?
+        } else {
+            load_or_build_context_index_in_memory(bench_path)?
+        };
         validate_context_index(bench_path, &index)?;
     } else {
         let index_path = bench_path.join(CONTEXT_INDEX_FILE);

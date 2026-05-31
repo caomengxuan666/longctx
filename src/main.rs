@@ -30,6 +30,15 @@ enum Commands {
         /// Overwrite existing results and request log files
         #[arg(long)]
         force: bool,
+        /// Validate config, select tests, and resolve auto routing without sending provider requests
+        #[arg(long)]
+        dry_run: bool,
+        /// Run only tests whose ID or suite contains this text
+        #[arg(long)]
+        filter: Option<String>,
+        /// Run at most this many selected tests
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Generate HTML report from results
     Report {
@@ -84,12 +93,36 @@ fn main() -> anyhow::Result<()> {
         } => {
             longctx::generator::generate(&suite, tokens, seed, &out)?;
         }
-        Commands::Run { bench_dir, force } => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(longctx::runner::run_benchmarks_with_options(
-                &bench_dir,
-                longctx::runner::RunOptions { force },
-            ))?;
+        Commands::Run {
+            bench_dir,
+            force,
+            dry_run,
+            filter,
+            limit,
+        } => {
+            let options = longctx::runner::RunOptions {
+                force,
+                dry_run,
+                filter,
+                limit,
+            };
+            if dry_run {
+                let summary = longctx::runner::dry_run_benchmarks(&bench_dir, options)?;
+                println!(
+                    "dry run ok: selected {}/{} tests for model {}",
+                    summary.selected_count, summary.total_count, summary.provider_model
+                );
+                println!(
+                    "auto contexts: {}/{} routed",
+                    summary.routed_auto_context_count, summary.auto_context_count
+                );
+                println!("suites: {}", summary.suites.join(", "));
+            } else {
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(longctx::runner::run_benchmarks_with_options(
+                    &bench_dir, options,
+                ))?;
+            }
         }
         Commands::Report { results, out, json } => {
             if json {

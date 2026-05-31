@@ -34,6 +34,8 @@ Run output safety:
 
 - `longctx run` refuses to overwrite an existing `results.jsonl` or request log by default.
 - Use `longctx run ./bench --force` when intentionally replacing prior output.
+- Use `longctx run ./bench --dry-run` to validate config, apply selection, and resolve auto routing without API credentials, provider requests, or output files.
+- Use `--filter <text>` to select tests by ID or suite substring and `--limit <n>` to cap the selected run set.
 - Duplicate test IDs are rejected during validation and run preflight.
 
 Generated benchmark layout:

@@ -47,10 +47,13 @@ Run generated benchmark cases against an OpenAI-compatible provider. The benchma
 ```sh
 longctx run ./bench
 longctx run ./bench --force
+longctx run ./bench --dry-run
+longctx run ./bench --filter needle --limit 2
 ```
 
 Results are written to `./bench/results.jsonl`.
 By default, `run` refuses to overwrite an existing `results.jsonl` or request log. Use `--force` when intentionally replacing prior output.
+Use `--dry-run` to validate config, select tests, and resolve `context = "auto"` without reading the API key, sending provider requests, or writing results. Use `--filter <text>` to select tests whose ID or suite contains the text, and `--limit <n>` to cap the selected set.
 
 ### `validate`
 
