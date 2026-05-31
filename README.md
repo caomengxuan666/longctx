@@ -88,12 +88,14 @@ Generated suites write this index automatically with deterministic metadata for 
 Generate a standalone HTML report from a results JSONL file.
 
 ```sh
+longctx report ./bench/results.jsonl
 longctx report ./bench/results.jsonl --out report.html
 longctx report ./bench/results.jsonl --json
 longctx report ./bench/results.jsonl --json --out report.json
 ```
 
 The report includes per-suite summaries, per-token-count summaries, trend charts, and failure groups.
+Without `--out`, HTML reports are written next to the results file under `reports/report.html`.
 When result rows include automatic routing decisions, the report shows the selected context, routing method, status, and confidence.
 `--json` emits a machine-readable summary.
 
@@ -144,7 +146,7 @@ longctx run ./bench
 Generate the report:
 
 ```sh
-longctx report ./bench/results.jsonl --out report.html
+longctx report ./bench/results.jsonl
 ```
 
 ## Config File Format
@@ -194,6 +196,7 @@ The runner accepts generated suite manifests and writes newline-delimited JSON r
 Result rows include the suite name, token count, provider model, HTTP status, provider request ID, rate-limit headers, attempt count, structured error kind when a run fails, optional judge audit details, and optional routing audit details. Readers reject result rows with a newer unsupported `schema_version`, and `compare` rejects duplicate result IDs.
 Each run also writes a `run.json` snapshot with config, timing metadata, and SHA256 fingerprints for benchmark manifests, contexts, and `context.index.json`.
 When `run.log_requests` is enabled, redacted HTTP exchange logs are written to `reports/http-log.jsonl`.
+Reports default to `reports/report.html` next to the results file unless `--out` is provided.
 Direct context file paths in manifests must resolve under the benchmark directory. Absolute paths and `..` paths that escape the benchmark directory are rejected before provider requests are sent.
 
 ## Automatic Context Routing

@@ -134,7 +134,7 @@ fn main() -> anyhow::Result<()> {
                     println!("{json_summary}");
                 }
             } else {
-                let out = out.unwrap_or_else(|| "report.html".to_string());
+                let out = out.unwrap_or_else(|| default_report_output(&results));
                 longctx::report::generate_html(&results, &out)?;
             }
         }
@@ -181,4 +181,15 @@ fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn default_report_output(results: &str) -> String {
+    let results_path = std::path::Path::new(results);
+    results_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("reports")
+        .join("report.html")
+        .to_string_lossy()
+        .into_owned()
 }

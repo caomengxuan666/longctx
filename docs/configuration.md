@@ -46,7 +46,7 @@ Generated benchmark layout:
 - `results.jsonl`: Benchmark run output with suite, token count, provider, request, latency, token, and error metadata.
 - `reports/http-log.jsonl`: Optional redacted request log output when enabled.
 - `run.json`: Run snapshot with timing, config metadata, and SHA256 fingerprints for manifests, contexts, and `context.index.json`.
-- `report.html` or `reports/*.html`: Human-readable report output.
+- `reports/report.html` by default, or an explicit `--out` path: Human-readable report output.
 
 Result durability:
 

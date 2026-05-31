@@ -45,6 +45,7 @@ The next work should make the loop dependable enough for repeat use.
 - Durable result writes that flush each completed row during long runs.
 - Token-suffixed generated manifests and contexts so token sweeps do not overwrite earlier suites.
 - Run snapshot artifact fingerprints for manifests, contexts, and `context.index.json`.
+- Default report output under `reports/report.html` next to the results file.
 
 ## Next priorities
 
@@ -61,4 +62,4 @@ The next work should make the loop dependable enough for repeat use.
 ### P2
 
 - Decide whether crates.io publishing is manual or automated.
-- Consider moving the default `report` output under `bench/reports/` while preserving explicit `--out` behavior.
+- No remaining P2 items.

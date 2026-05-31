@@ -203,6 +203,14 @@ fn cli_report_and_compare_outputs() {
     assert!(report_json.contains("\"total\": 1"));
     assert!(report_json.contains("\"passed\": 1"));
 
+    assert_success(
+        longctx()
+            .args(["report", candidate.to_str().unwrap()])
+            .output()
+            .unwrap(),
+    );
+    assert!(tmp.path().join("reports/report.html").exists());
+
     let report_path: PathBuf = tmp.path().join("report.html");
     assert_success(
         longctx()

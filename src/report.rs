@@ -173,6 +173,13 @@ pub fn generate_html(results_path: &str, out_path: &str) -> Result<()> {
     };
 
     let html = view.render().context("failed to render report template")?;
+    if let Some(parent) = std::path::Path::new(out_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create report directory {}", parent.display())
+            })?;
+        }
+    }
     fs::write(out_path, html).with_context(|| format!("failed to write report {out_path}"))?;
     Ok(())
 }
@@ -508,6 +515,17 @@ mod tests {
         let html = fs::read_to_string(out).unwrap();
         assert!(html.contains("Long Context Benchmark Report"));
         assert!(html.contains(">0<"));
+    }
+
+    #[test]
+    fn report_creates_output_parent_directory() {
+        let tmp = tempdir().unwrap();
+        let results = tmp.path().join("results.jsonl");
+        let out = tmp.path().join("reports/report.html");
+        fs::write(&results, "").unwrap();
+
+        generate_html(results.to_str().unwrap(), out.to_str().unwrap()).unwrap();
+        assert!(out.exists());
     }
 
     #[test]
