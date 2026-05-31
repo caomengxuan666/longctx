@@ -4,8 +4,12 @@ use std::fs;
 fn docs_cover_current_cli_and_config_surface() {
     let cargo_toml = fs::read_to_string("Cargo.toml").expect("Cargo.toml should be readable");
     assert!(cargo_toml.contains("rust-version = \"1.86\""));
+    assert!(cargo_toml.contains("license = \"MIT\""));
     assert!(cargo_toml.contains("\"/report.html\""));
     assert!(cargo_toml.contains("\".codex.toml\""));
+
+    let license = fs::read_to_string("LICENSE").expect("LICENSE should be readable");
+    assert!(license.contains("MIT License"));
 
     let readme = fs::read_to_string("README.md").expect("README.md should be readable");
     for command in ["generate", "run", "validate", "report", "compare", "index"] {
@@ -47,6 +51,7 @@ fn docs_cover_current_cli_and_config_surface() {
     assert!(readme.contains("Minimum supported Rust version: 1.86"));
     assert!(readme.contains("cargo install longctx"));
     assert!(readme.contains("SHA256"));
+    assert!(readme.contains("MIT License"));
 
     let config = fs::read_to_string("docs/configuration.md")
         .expect("docs/configuration.md should be readable");

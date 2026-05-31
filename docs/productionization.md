@@ -49,6 +49,7 @@ The next work should make the loop dependable enough for repeat use.
 - Default report output under `reports/report.html` next to the results file.
 - CI coverage for Linux stable, MSRV 1.86, and platform tests for macOS and Windows.
 - Tag-based release automation with test gates, target-named archives, SHA256 checksums, and GitHub Release assets.
+- MIT license metadata and root `LICENSE` file for crate publication.
 
 ## Next priorities
 
@@ -58,7 +59,7 @@ The next work should make the loop dependable enough for repeat use.
 
 ### P1
 
-- Decide and add the project license before publishing to crates.io.
+- No remaining P1 items.
 
 ### P2
 

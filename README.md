@@ -225,3 +225,7 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo build
 ```
+
+## License
+
+LongContextBench is licensed under the MIT License. See [LICENSE](LICENSE).
