@@ -1,5 +1,6 @@
 use crate::benchmark::BenchmarkResult;
 use anyhow::{Context, Result};
+use askama::Template;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -65,6 +66,12 @@ impl ComparisonSummary {
     }
 }
 
+#[derive(Template)]
+#[template(path = "compare.html")]
+struct CompareView<'a> {
+    summary: &'a ComparisonSummary,
+}
+
 pub fn compare_results(baseline_path: &str, candidate_path: &str) -> Result<ComparisonSummary> {
     let baseline = read_results(baseline_path)?;
     let candidate = read_results(candidate_path)?;
@@ -122,7 +129,10 @@ pub fn compare_results(baseline_path: &str, candidate_path: &str) -> Result<Comp
 }
 
 pub fn write_comparison_html(summary: &ComparisonSummary, out_path: &str) -> Result<()> {
-    let html = summary_to_html(summary);
+    let view = CompareView { summary };
+    let html = view
+        .render()
+        .context("failed to render comparison template")?;
     fs::write(out_path, html)
         .with_context(|| format!("failed to write comparison report {out_path}"))
 }
@@ -133,104 +143,6 @@ fn average_delta(sum: i128, count: usize) -> i64 {
     }
     let average = sum / count as i128;
     average.clamp(i64::MIN as i128, i64::MAX as i128) as i64
-}
-
-fn summary_to_html(summary: &ComparisonSummary) -> String {
-    let rows = [
-        ("Baseline total", summary.baseline_total.to_string()),
-        ("Candidate total", summary.candidate_total.to_string()),
-        ("Common total", summary.common_total.to_string()),
-        ("Improved", summary.improved_ids.len().to_string()),
-        ("Regressed", summary.regressed_ids.len().to_string()),
-        ("Added", summary.added_ids.len().to_string()),
-        ("Removed", summary.removed_ids.len().to_string()),
-        (
-            "Avg latency delta ms",
-            summary.avg_latency_delta_ms.to_string(),
-        ),
-        (
-            "Avg input tokens delta",
-            summary.avg_input_tokens_delta.to_string(),
-        ),
-        (
-            "Avg output tokens delta",
-            summary.avg_output_tokens_delta.to_string(),
-        ),
-    ];
-
-    let list_block = |title: &str, items: &[String]| {
-        if items.is_empty() {
-            format!("<p>{title}: none</p>")
-        } else {
-            format!(
-                "<h3>{title}</h3><pre>{}</pre>",
-                escape_html(&items.join(", "))
-            )
-        }
-    };
-
-    let metrics = rows
-        .into_iter()
-        .map(|(label, value)| {
-            format!(
-                "<tr><th>{}</th><td>{}</td></tr>",
-                escape_html(label),
-                escape_html(&value)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    format!(
-        r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Long Context Comparison Report</title>
-  <style>
-    body {{ font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 32px; color: #1f2933; background: #f7f8fa; }}
-    main {{ max-width: 1100px; margin: 0 auto; }}
-    h1 {{ font-size: 28px; margin-bottom: 18px; }}
-    h2 {{ font-size: 18px; margin: 24px 0 10px; }}
-    table {{ width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d9dee7; }}
-    th, td {{ padding: 10px 12px; border-bottom: 1px solid #e4e7ec; text-align: left; vertical-align: top; }}
-    th {{ width: 240px; background: #eef1f5; }}
-    pre {{ white-space: pre-wrap; margin: 0; background: #fff; border: 1px solid #d9dee7; padding: 12px; }}
-  </style>
-</head>
-<body>
-<main>
-  <h1>Long Context Comparison Report</h1>
-  <table>
-{metrics}
-  </table>
-  <h2>Improved IDs</h2>
-  {}
-  <h2>Regressed IDs</h2>
-  {}
-  <h2>Added IDs</h2>
-  {}
-  <h2>Removed IDs</h2>
-  {}
-</main>
-</body>
-</html>
-"#,
-        list_block("Improved IDs", &summary.improved_ids),
-        list_block("Regressed IDs", &summary.regressed_ids),
-        list_block("Added IDs", &summary.added_ids),
-        list_block("Removed IDs", &summary.removed_ids),
-    )
-}
-
-fn escape_html(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
 }
 
 fn read_results(path: &str) -> Result<BTreeMap<String, BenchmarkResult>> {
@@ -358,10 +270,69 @@ mod tests {
             avg_output_tokens_delta: 2,
         };
 
-        let html = summary_to_html(&summary);
+        let view = CompareView { summary: &summary };
+        let html = view.render().unwrap();
         assert!(html.contains("Long Context Comparison Report"));
         assert!(html.contains("Improved IDs"));
         assert!(html.contains("Candidate total"));
         assert!(html.contains("a"));
+    }
+
+    #[test]
+    fn compare_handles_empty_files() {
+        let tmp = tempdir().unwrap();
+        let baseline = tmp.path().join("baseline.jsonl");
+        let candidate = tmp.path().join("candidate.jsonl");
+        fs::write(&baseline, "").unwrap();
+        fs::write(&candidate, "").unwrap();
+
+        let summary =
+            compare_results(baseline.to_str().unwrap(), candidate.to_str().unwrap()).unwrap();
+        assert_eq!(summary.baseline_total, 0);
+        assert_eq!(summary.candidate_total, 0);
+        assert_eq!(summary.common_total, 0);
+        assert_eq!(summary.avg_latency_delta_ms, 0);
+    }
+
+    #[test]
+    fn compare_handles_no_common_ids() {
+        let tmp = tempdir().unwrap();
+        let baseline = tmp.path().join("baseline.jsonl");
+        let candidate = tmp.path().join("candidate.jsonl");
+        fs::write(&baseline, format!("{}\n", result_line("a", true))).unwrap();
+        fs::write(&candidate, format!("{}\n", result_line("b", true))).unwrap();
+
+        let summary =
+            compare_results(baseline.to_str().unwrap(), candidate.to_str().unwrap()).unwrap();
+        assert_eq!(summary.common_total, 0);
+        assert!(summary.improved_ids.is_empty());
+        assert!(summary.regressed_ids.is_empty());
+        assert_eq!(summary.added_ids, vec!["b"]);
+        assert_eq!(summary.removed_ids, vec!["a"]);
+    }
+
+    #[test]
+    fn comparison_html_with_empty_lists() {
+        let summary = ComparisonSummary {
+            baseline_total: 0,
+            candidate_total: 0,
+            common_total: 0,
+            improved_ids: vec![],
+            regressed_ids: vec![],
+            added_ids: vec![],
+            removed_ids: vec![],
+            avg_latency_delta_ms: 0,
+            avg_input_tokens_delta: 0,
+            avg_output_tokens_delta: 0,
+        };
+
+        let view = CompareView { summary: &summary };
+        let html = view.render().unwrap();
+        assert!(html.contains("none"));
+    }
+
+    #[test]
+    fn average_delta_returns_zero_for_empty() {
+        assert_eq!(average_delta(0, 0), 0);
     }
 }

@@ -176,4 +176,115 @@ model = "example-model"
         let error = validate_benchmark_dir(tmp.path().to_str().unwrap(), false).unwrap_err();
         assert!(error.to_string().contains("context does not resolve"));
     }
+
+    #[test]
+    fn validate_rejects_nonexistent_benchmark_dir() {
+        let error = validate_benchmark_dir("/nonexistent/path/12345", false).unwrap_err();
+        assert!(error.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_base_url() {
+        let tmp = tempdir().unwrap();
+        write_valid_fixture(tmp.path());
+        fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[provider]
+base_url = ""
+api_key_env = "EXAMPLE_API_KEY"
+model = "example-model"
+"#,
+        )
+        .unwrap();
+
+        let error = validate_benchmark_dir(tmp.path().to_str().unwrap(), false).unwrap_err();
+        assert!(error.to_string().contains("base_url"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_model() {
+        let tmp = tempdir().unwrap();
+        write_valid_fixture(tmp.path());
+        fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[provider]
+base_url = "https://api.example.test/v1"
+api_key_env = "EXAMPLE_API_KEY"
+model = ""
+"#,
+        )
+        .unwrap();
+
+        let error = validate_benchmark_dir(tmp.path().to_str().unwrap(), false).unwrap_err();
+        assert!(error.to_string().contains("model"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_timeout() {
+        let tmp = tempdir().unwrap();
+        write_valid_fixture(tmp.path());
+        fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[provider]
+base_url = "https://api.example.test/v1"
+api_key_env = "EXAMPLE_API_KEY"
+model = "example-model"
+
+[run]
+request_timeout_secs = 0
+"#,
+        )
+        .unwrap();
+
+        let error = validate_benchmark_dir(tmp.path().to_str().unwrap(), false).unwrap_err();
+        assert!(error.to_string().contains("request_timeout_secs"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_concurrency() {
+        let tmp = tempdir().unwrap();
+        write_valid_fixture(tmp.path());
+        fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[provider]
+base_url = "https://api.example.test/v1"
+api_key_env = "EXAMPLE_API_KEY"
+model = "example-model"
+
+[run]
+concurrency = 0
+"#,
+        )
+        .unwrap();
+
+        let error = validate_benchmark_dir(tmp.path().to_str().unwrap(), false).unwrap_err();
+        assert!(error.to_string().contains("concurrency"));
+    }
+
+    #[test]
+    fn context_is_resolvable_with_inline_content() {
+        let tmp = tempdir().unwrap();
+        assert!(context_is_resolvable(
+            tmp.path(),
+            "some inline text\nwith newline"
+        ));
+        let long_text = "x".repeat(5000);
+        assert!(context_is_resolvable(tmp.path(), &long_text));
+    }
+
+    #[test]
+    fn context_is_resolvable_with_absolute_path() {
+        let tmp = tempdir().unwrap();
+        let file = tmp.path().join("test.txt");
+        fs::write(&file, "content").unwrap();
+        assert!(context_is_resolvable(tmp.path(), &file.to_string_lossy()));
+        assert!(!context_is_resolvable(
+            tmp.path(),
+            "/nonexistent/absolute/path.txt"
+        ));
+    }
 }

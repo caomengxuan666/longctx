@@ -8,9 +8,11 @@ clap = { features = ["derive"], version = "4" }
 serde = { features = ["derive"], version = "1" }
 serde_json = "1"
 anyhow = "1"
+askama = "0.12"
 tokio = { features = ["full"], version = "1" }
 reqwest = { features = ["json"], version = "0.12" }
 sha2 = "0.10"
+tiktoken-rs = "0.6"
 walkdir = "2"
 regex = "1"
 rand = "0.8"
@@ -18,3 +20,4 @@ toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
+wiremock = "0.6"

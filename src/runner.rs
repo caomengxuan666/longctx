@@ -1,8 +1,9 @@
 use crate::benchmark::{
-    BenchmarkResult, Config, ErrorKind, ProviderConfig, RunConfig, RunMetadata, SuiteManifest,
-    TestCase, SCHEMA_VERSION,
+    BenchmarkResult, Config, ErrorKind, GraderConfig, ProviderConfig, RunConfig, RunMetadata,
+    SuiteManifest, TestCase, SCHEMA_VERSION,
 };
-use crate::grader::grade;
+use crate::grader::{grade, grade_with_llm};
+use crate::tokenizer::TokenCounter;
 use anyhow::{anyhow, Context, Result};
 use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
@@ -55,14 +56,17 @@ pub async fn run_benchmarks(bench_dir: &str) -> Result<()> {
     let client = Client::builder()
         .build()
         .context("failed to build HTTP client")?;
+    let counter = TokenCounter::cl100k();
     let tests_for_run = tests.clone();
     let results = run_all(
         client,
         config.provider.clone(),
         config.run.clone(),
+        config.grader.clone(),
         api_key,
         bench_path.to_path_buf(),
         tests_for_run,
+        &counter,
     )
     .await?;
 
@@ -187,13 +191,16 @@ fn unix_ms_now() -> u64 {
         .as_millis() as u64
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_all(
     client: Client,
     provider: ProviderConfig,
     run: RunConfig,
+    grader_config: GraderConfig,
     api_key: String,
     bench_path: PathBuf,
     tests: Vec<TestCase>,
+    counter: &TokenCounter,
 ) -> Result<Vec<BenchmarkResult>> {
     let concurrency = run.concurrency.max(1);
     let total = tests.len();
@@ -213,10 +220,22 @@ async fn run_all(
         let client = client.clone();
         let provider = provider.clone();
         let run = run.clone();
+        let grader_config = grader_config.clone();
         let api_key = api_key.clone();
         let bench_path = bench_path.clone();
+        let counter = counter.clone();
         tasks.spawn(async move {
-            let result = run_one(&client, &provider, &run, &api_key, &bench_path, &test).await;
+            let result = run_one(
+                &client,
+                &provider,
+                &run,
+                &grader_config,
+                &api_key,
+                &bench_path,
+                &test,
+                &counter,
+            )
+            .await;
             (idx, result)
         });
     }
@@ -233,13 +252,16 @@ async fn run_all(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_one(
     client: &Client,
     provider: &ProviderConfig,
     run: &RunConfig,
+    grader_config: &GraderConfig,
     api_key: &str,
     bench_dir: &Path,
     test: &TestCase,
+    counter: &TokenCounter,
 ) -> BenchmarkResult {
     let started = Instant::now();
     let context = match load_context(bench_dir, &test.context) {
@@ -264,24 +286,69 @@ async fn run_one(
                 answer: None,
                 error: Some(error.to_string()),
                 error_kind: Some(ErrorKind::ContextLoad),
+                judge_latency_ms: None,
+                judge_input_tokens: None,
+                metadata: test.metadata.clone(),
             };
         }
     };
     let prompt = build_prompt(&context, &test.question);
-    let input_tokens = estimate_tokens(&prompt);
+    let input_tokens = counter.count_tokens(&prompt);
 
     let response = match provider.request_style {
         crate::benchmark::ProviderRequestStyle::ChatCompletions => {
-            send_chat_completion(client, run, provider, api_key, &prompt, input_tokens).await
+            send_chat_completion(
+                client,
+                run,
+                provider,
+                api_key,
+                &prompt,
+                input_tokens,
+                counter,
+            )
+            .await
         }
         crate::benchmark::ProviderRequestStyle::Responses => {
-            send_responses(client, run, provider, api_key, &prompt, input_tokens).await
+            send_responses(
+                client,
+                run,
+                provider,
+                api_key,
+                &prompt,
+                input_tokens,
+                counter,
+            )
+            .await
         }
     };
 
     match response {
         Ok(output) => {
-            let passed = grade(&output.answer, test);
+            let (passed, judge_lat, judge_tok) =
+                if matches!(test.grader, crate::benchmark::Grader::LlmJudge) {
+                    let judge_model = grader_config
+                        .judge_model
+                        .as_deref()
+                        .unwrap_or(&provider.model);
+                    let judge_result = grade_with_llm(
+                        &output.answer,
+                        test,
+                        &context,
+                        client,
+                        &provider.base_url,
+                        api_key,
+                        judge_model,
+                        counter,
+                    )
+                    .await;
+                    (
+                        judge_result.passed,
+                        Some(judge_result.latency_ms),
+                        Some(judge_result.input_tokens),
+                    )
+                } else {
+                    (grade(&output.answer, test), None, None)
+                };
             BenchmarkResult {
                 schema_version: SCHEMA_VERSION,
                 suite: suite_name(test),
@@ -309,6 +376,9 @@ async fn run_one(
                 } else {
                     Some(ErrorKind::Validation)
                 },
+                judge_latency_ms: judge_lat,
+                judge_input_tokens: judge_tok,
+                metadata: test.metadata.clone(),
             }
         }
         Err(failure) => error_result(ErrorResultInput {
@@ -334,6 +404,7 @@ async fn send_chat_completion(
     api_key: &str,
     prompt: &str,
     input_tokens: u64,
+    counter: &TokenCounter,
 ) -> std::result::Result<ProviderOutput, ProviderFailure> {
     let request = ChatCompletionRequest {
         model: provider.model.clone(),
@@ -361,7 +432,7 @@ async fn send_chat_completion(
         .body
         .usage
         .as_ref()
-        .map_or_else(|| estimate_tokens(&answer), |u| u.completion_tokens);
+        .map_or_else(|| counter.count_tokens(&answer), |u| u.completion_tokens);
     let input_tokens = response
         .body
         .usage
@@ -386,6 +457,7 @@ async fn send_responses(
     api_key: &str,
     prompt: &str,
     input_tokens: u64,
+    counter: &TokenCounter,
 ) -> std::result::Result<ProviderOutput, ProviderFailure> {
     let request = ResponsesRequest {
         model: provider.model.clone(),
@@ -409,7 +481,7 @@ async fn send_responses(
         .usage
         .as_ref()
         .and_then(|usage| usage.output_tokens)
-        .unwrap_or_else(|| estimate_tokens(&answer));
+        .unwrap_or_else(|| counter.count_tokens(&answer));
     Ok(ProviderOutput {
         answer,
         input_tokens,
@@ -611,6 +683,9 @@ fn error_result<E: std::fmt::Display>(input: ErrorResultInput<'_, E>) -> Benchma
         answer: None,
         error: Some(input.error.to_string()),
         error_kind: Some(input.kind),
+        judge_latency_ms: None,
+        judge_input_tokens: None,
+        metadata: input.test.metadata.clone(),
     }
 }
 
@@ -689,10 +764,6 @@ fn load_context(bench_dir: &Path, context: &str) -> Result<String> {
     }
 
     Ok(context.to_string())
-}
-
-fn estimate_tokens(text: &str) -> u64 {
-    text.split_whitespace().count() as u64
 }
 
 #[derive(Debug, Serialize)]
@@ -993,6 +1064,7 @@ request_style = "responses"
                 model: "example-model".to_string(),
                 request_style: crate::benchmark::ProviderRequestStyle::ChatCompletions,
             },
+            grader: GraderConfig::default(),
         };
         let mut metadata = BTreeMap::new();
         metadata.insert("suite".to_string(), "needle".to_string());
@@ -1102,6 +1174,9 @@ request_style = "responses"
             answer: Some("orchid-123".to_string()),
             error: None,
             error_kind: None,
+            judge_latency_ms: None,
+            judge_input_tokens: None,
+            metadata: BTreeMap::new(),
         };
         let log_path = tmp.path().join("reports/http-log.jsonl");
 
@@ -1112,5 +1187,158 @@ request_style = "responses"
         assert!(log.contains("response_sha256"));
         assert!(!log.contains("archive access code"));
         assert!(!log.contains("orchid-123"));
+    }
+
+    #[test]
+    fn retry_delay_exponentiates() {
+        let run = RunConfig {
+            retry_backoff_ms: 100,
+            ..Default::default()
+        };
+        assert_eq!(retry_delay(&run, 1), Duration::from_millis(100));
+        assert_eq!(retry_delay(&run, 2), Duration::from_millis(200));
+        assert_eq!(retry_delay(&run, 3), Duration::from_millis(400));
+    }
+
+    #[test]
+    fn retry_delay_saturates_at_max() {
+        let run = RunConfig {
+            retry_backoff_ms: 100,
+            ..Default::default()
+        };
+        let delay = retry_delay(&run, 20);
+        assert_eq!(delay, Duration::from_millis(100 * 1024));
+    }
+
+    #[test]
+    fn is_retryable_status_classifies_correctly() {
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(is_retryable_status(StatusCode::BAD_GATEWAY));
+        assert!(is_retryable_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(is_retryable_status(StatusCode::GATEWAY_TIMEOUT));
+        assert!(is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(!is_retryable_status(StatusCode::OK));
+        assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_status(StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn load_context_reads_from_bench_dir() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("contexts")).unwrap();
+        fs::write(tmp.path().join("contexts/test.txt"), "hello world").unwrap();
+        let content = load_context(tmp.path(), "contexts/test.txt").unwrap();
+        assert_eq!(content, "hello world");
+    }
+
+    #[test]
+    fn load_context_returns_inline_for_missing_file() {
+        let tmp = tempdir().unwrap();
+        let content = load_context(tmp.path(), "some inline text").unwrap();
+        assert_eq!(content, "some inline text");
+    }
+
+    #[test]
+    fn build_prompt_formats_correctly() {
+        let prompt = build_prompt("some context", "some question");
+        assert!(prompt.contains("some context"));
+        assert!(prompt.contains("some question"));
+        assert!(prompt.starts_with("Use the context"));
+    }
+
+    #[tokio::test]
+    async fn wiremock_chat_completion_success() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "ORCHID-123"}}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 5}
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = Client::builder().build().unwrap();
+        let provider = ProviderConfig {
+            base_url: mock_server.uri(),
+            api_key_env: "TEST_KEY".to_string(),
+            model: "test-model".to_string(),
+            request_style: crate::benchmark::ProviderRequestStyle::ChatCompletions,
+        };
+        let run = RunConfig::default();
+        let counter = TokenCounter::cl100k();
+
+        let result = send_chat_completion(
+            &client,
+            &run,
+            &provider,
+            "test-key",
+            "test prompt",
+            10,
+            &counter,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.answer, "ORCHID-123");
+        assert_eq!(result.input_tokens, 100);
+        assert_eq!(result.output_tokens, 5);
+        assert_eq!(result.attempts, 1);
+        assert_eq!(result.http_status, Some(200));
+    }
+
+    #[tokio::test]
+    async fn wiremock_retries_on_server_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(2)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 1}
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = Client::builder().build().unwrap();
+        let provider = ProviderConfig {
+            base_url: mock_server.uri(),
+            api_key_env: "TEST_KEY".to_string(),
+            model: "test-model".to_string(),
+            request_style: crate::benchmark::ProviderRequestStyle::ChatCompletions,
+        };
+        let run = RunConfig {
+            max_retries: 3,
+            retry_backoff_ms: 1,
+            ..Default::default()
+        };
+        let counter = TokenCounter::cl100k();
+
+        let result = send_chat_completion(
+            &client,
+            &run,
+            &provider,
+            "test-key",
+            "test prompt",
+            10,
+            &counter,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.answer, "ok");
+        assert_eq!(result.attempts, 3);
     }
 }

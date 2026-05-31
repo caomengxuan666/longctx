@@ -23,11 +23,19 @@ Supported suites:
 - `needle`: hides one target fact in a long filler context.
 - `multi-needle`: hides several facts that must be returned together.
 - `conflict`: includes older or adjacent facts and asks for the scoped current answer.
+- `multi-hop`: chains two related facts (e.g. project lead and badge code) and asks for a transitive answer.
+- `order-dependent`: generates sequenced facts with timestamps and asks for a value at a specific step.
+- `position-sweep`: places a needle at 5 positions (start/early/middle/late/end) to measure the "lost in the middle" effect.
+- `hallucination`: pure filler context with questions about non-existent facts; tests whether the model fabricates answers.
 
 ```sh
 longctx generate needle --tokens 100000 --out ./bench
 longctx generate multi-needle --tokens 100000 --out ./bench
 longctx generate conflict --tokens 100000 --out ./bench
+longctx generate multi-hop --tokens 100000 --out ./bench
+longctx generate order-dependent --tokens 100000 --out ./bench
+longctx generate position-sweep --tokens 100000 --out ./bench
+longctx generate hallucination --tokens 100000 --out ./bench
 ```
 
 Add `--seed <value>` to make generation reproducible.
@@ -138,6 +146,15 @@ Fields:
 - `request_style`: Provider request style, either `chat-completions` or `responses`.
 - `log_requests`: Write opt-in redacted HTTP exchange logs under `reports/`.
 - `request_log_path`: Path for the request log file, defaulting to `reports/http-log.jsonl`.
+
+The config also supports an optional `[grader]` section for LLM-as-judge grading:
+
+```toml
+[grader]
+judge_model = "gpt-4.1-mini"  # optional, defaults to the same provider model
+```
+
+When a test case uses `Grader::LlmJudge`, the runner sends the answer to the judge model for evaluation instead of using exact string matching.
 
 Any provider that exposes an OpenAI-compatible `/chat/completions` endpoint can be used by changing `base_url`, `api_key_env`, and `model`.
 

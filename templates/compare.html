@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Long Context Comparison Report</title>
+  <style>
+    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 32px; color: #1f2933; background: #f7f8fa; }
+    main { max-width: 1100px; margin: 0 auto; }
+    h1 { font-size: 28px; margin-bottom: 18px; }
+    h2 { font-size: 18px; margin: 24px 0 10px; }
+    table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d9dee7; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid #e4e7ec; text-align: left; vertical-align: top; }
+    th { width: 240px; background: #eef1f5; }
+    pre { white-space: pre-wrap; margin: 0; background: #fff; border: 1px solid #d9dee7; padding: 12px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Long Context Comparison Report</h1>
+  <table>
+    <tr><th>Baseline total</th><td>{{ summary.baseline_total }}</td></tr>
+    <tr><th>Candidate total</th><td>{{ summary.candidate_total }}</td></tr>
+    <tr><th>Common total</th><td>{{ summary.common_total }}</td></tr>
+    <tr><th>Improved</th><td>{{ summary.improved_ids.len() }}</td></tr>
+    <tr><th>Regressed</th><td>{{ summary.regressed_ids.len() }}</td></tr>
+    <tr><th>Added</th><td>{{ summary.added_ids.len() }}</td></tr>
+    <tr><th>Removed</th><td>{{ summary.removed_ids.len() }}</td></tr>
+    <tr><th>Avg latency delta ms</th><td>{{ summary.avg_latency_delta_ms }}</td></tr>
+    <tr><th>Avg input tokens delta</th><td>{{ summary.avg_input_tokens_delta }}</td></tr>
+    <tr><th>Avg output tokens delta</th><td>{{ summary.avg_output_tokens_delta }}</td></tr>
+  </table>
+  <h2>Improved IDs</h2>
+{% if summary.improved_ids.is_empty() %}
+  <p>Improved IDs: none</p>
+{% else %}
+  <h3>Improved IDs</h3><pre>{{ summary.improved_ids|join(", ") }}</pre>
+{% endif %}
+  <h2>Regressed IDs</h2>
+{% if summary.regressed_ids.is_empty() %}
+  <p>Regressed IDs: none</p>
+{% else %}
+  <h3>Regressed IDs</h3><pre>{{ summary.regressed_ids|join(", ") }}</pre>
+{% endif %}
+  <h2>Added IDs</h2>
+{% if summary.added_ids.is_empty() %}
+  <p>Added IDs: none</p>
+{% else %}
+  <h3>Added IDs</h3><pre>{{ summary.added_ids|join(", ") }}</pre>
+{% endif %}
+  <h2>Removed IDs</h2>
+{% if summary.removed_ids.is_empty() %}
+  <p>Removed IDs: none</p>
+{% else %}
+  <h3>Removed IDs</h3><pre>{{ summary.removed_ids|join(", ") }}</pre>
+{% endif %}
+</main>
+</body>
+</html>

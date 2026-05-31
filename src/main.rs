@@ -11,7 +11,7 @@ struct Cli {
 enum Commands {
     /// Generate synthetic benchmark suites
     Generate {
-        /// Suite type: needle, multi-needle, conflict
+        /// Suite type: needle, multi-needle, conflict, multi-hop, order-dependent, position-sweep, hallucination
         suite: String,
         /// Number of tokens for the context
         #[arg(long, default_value = "100000")]

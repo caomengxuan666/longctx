@@ -1,5 +1,6 @@
 use crate::benchmark::BenchmarkResult;
 use anyhow::{Context, Result};
+use askama::Template;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -12,6 +13,7 @@ pub struct ReportSummary {
     pub avg_latency_ms: u64,
     pub suites: Vec<AggregateSummary>,
     pub token_counts: Vec<AggregateSummary>,
+    pub positions: Vec<AggregateSummary>,
     pub failure_groups: Vec<FailureGroupSummary>,
 }
 
@@ -21,6 +23,7 @@ pub struct AggregateSummary {
     pub total: usize,
     pub passed: usize,
     pub pass_rate: f64,
+    pub pass_rate_fmt: String,
     pub avg_latency_ms: u64,
 }
 
@@ -41,17 +44,45 @@ pub fn generate_summary(results_path: &str) -> Result<ReportSummary> {
     Ok(build_summary(&results))
 }
 
+struct ResultRow {
+    id: String,
+    suite_display: String,
+    token_count_display: String,
+    model_display: String,
+    status_class: &'static str,
+    status_text: &'static str,
+    attempts: u32,
+    latency_ms: u64,
+    input_tokens: u64,
+    http_status_display: String,
+    request_id_display: String,
+    rate_limit_remaining_display: String,
+    rate_limit_reset_display: String,
+    error_kind_display: String,
+    answer_display: String,
+    error_display: String,
+}
+
+#[derive(Template)]
+#[template(path = "report.html")]
+struct ReportView<'a> {
+    total: usize,
+    passed: usize,
+    pass_rate_fmt: String,
+    avg_latency_ms: u64,
+    latency_trend: String,
+    token_trend: String,
+    suite_rows: &'a [AggregateSummary],
+    token_counts: &'a [AggregateSummary],
+    position_rows: &'a [AggregateSummary],
+    failure_groups: &'a [FailureGroupSummary],
+    results: Vec<ResultRow>,
+}
+
 pub fn generate_html(results_path: &str, out_path: &str) -> Result<()> {
     let results = read_results(results_path)?;
     let summary = build_summary(&results);
 
-    let total = summary.total;
-    let passed = summary.passed;
-    let pass_rate = summary.pass_rate;
-    let avg_latency = summary.avg_latency_ms;
-    let suite_rows = render_suite_rows(&results);
-    let token_rows = render_token_rows(&results);
-    let failure_rows = render_failure_rows(&results);
     let latency_trend = render_line_chart(
         &results
             .iter()
@@ -67,130 +98,63 @@ pub fn generate_html(results_path: &str, out_path: &str) -> Result<()> {
         "#0f766e",
     );
 
-    let rows = results
+    let result_rows: Vec<ResultRow> = results
         .iter()
         .map(|result| {
-            let status = if result.passed { "pass" } else { "fail" };
-            let error_kind = result
-                .error_kind
-                .as_ref()
-                .map(|kind| format!("{kind:?}"))
-                .unwrap_or_default();
-            format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"{}\">{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"answer\">{}</td><td class=\"error\">{}</td></tr>",
-                escape_html(&result.id),
-                escape_html(result.suite.as_deref().unwrap_or("")),
-                result
+            let (status_class, status_text) = if result.passed {
+                ("pass", "pass")
+            } else {
+                ("fail", "fail")
+            };
+            ResultRow {
+                id: result.id.clone(),
+                suite_display: result.suite.clone().unwrap_or_default(),
+                token_count_display: result
                     .token_count
-                    .map(|token_count| token_count.to_string())
+                    .map(|tc| tc.to_string())
                     .unwrap_or_default(),
-                escape_html(result.provider_model.as_deref().unwrap_or("")),
-                status,
-                status,
-                result.attempts,
-                result.latency_ms,
-                result.input_tokens,
-                result
+                model_display: result.provider_model.clone().unwrap_or_default(),
+                status_class,
+                status_text,
+                attempts: result.attempts,
+                latency_ms: result.latency_ms,
+                input_tokens: result.input_tokens,
+                http_status_display: result
                     .http_status
-                    .map(|status| status.to_string())
+                    .map(|s| s.to_string())
                     .unwrap_or_default(),
-                escape_html(result.request_id.as_deref().unwrap_or("")),
-                escape_html(result.rate_limit_remaining.as_deref().unwrap_or("")),
-                escape_html(result.rate_limit_reset.as_deref().unwrap_or("")),
-                escape_html(&error_kind),
-                escape_html(result.answer.as_deref().unwrap_or("")),
-                escape_html(result.error.as_deref().unwrap_or("")),
-            )
+                request_id_display: result.request_id.clone().unwrap_or_default(),
+                rate_limit_remaining_display: result
+                    .rate_limit_remaining
+                    .clone()
+                    .unwrap_or_default(),
+                rate_limit_reset_display: result.rate_limit_reset.clone().unwrap_or_default(),
+                error_kind_display: result
+                    .error_kind
+                    .as_ref()
+                    .map(|k| format!("{k:?}"))
+                    .unwrap_or_default(),
+                answer_display: result.answer.clone().unwrap_or_default(),
+                error_display: result.error.clone().unwrap_or_default(),
+            }
         })
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect();
 
-    let html = format!(
-        r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Long Context Benchmark Report</title>
-  <style>
-    body {{ font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 32px; color: #1f2933; background: #f7f8fa; }}
-    main {{ max-width: 1280px; margin: 0 auto; }}
-    h1 {{ font-size: 28px; margin-bottom: 18px; }}
-    h2 {{ font-size: 18px; margin: 0 0 10px; }}
-    .summary {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 24px; }}
-    .split {{ display: grid; grid-template-columns: minmax(0, 2fr) minmax(260px, 1fr); gap: 18px; margin-bottom: 24px; }}
-    .metric {{ background: #fff; border: 1px solid #d9dee7; border-radius: 8px; padding: 14px; }}
-    .metric span {{ display: block; color: #52606d; font-size: 13px; }}
-    .metric strong {{ display: block; font-size: 24px; margin-top: 4px; }}
-    table {{ width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d9dee7; table-layout: fixed; }}
-    th, td {{ padding: 10px 12px; border-bottom: 1px solid #e4e7ec; text-align: left; font-size: 14px; vertical-align: top; word-break: break-word; }}
-    th {{ background: #eef1f5; font-weight: 650; }}
-    .trends {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; margin-bottom: 24px; }}
-    .trends svg {{ width: 100%; height: auto; background: #fff; border: 1px solid #d9dee7; border-radius: 8px; }}
-    .pass {{ color: #0b6b3a; font-weight: 650; }}
-    .fail {{ color: #a61b1b; font-weight: 650; }}
-    .answer {{ white-space: pre-wrap; }}
-    .error {{ white-space: pre-wrap; color: #52606d; }}
-  </style>
-</head>
-<body>
-<main>
-  <h1>Long Context Benchmark Report</h1>
-  <section class="summary">
-    <div class="metric"><span>Total</span><strong>{total}</strong></div>
-    <div class="metric"><span>Passed</span><strong>{passed}</strong></div>
-    <div class="metric"><span>Pass rate</span><strong>{pass_rate:.1}%</strong></div>
-    <div class="metric"><span>Avg latency</span><strong>{avg_latency} ms</strong></div>
-  </section>
-  <section class="trends">
-    <div>
-      <h2>Latency Trend</h2>
-      {latency_trend}
-    </div>
-    <div>
-      <h2>Input Tokens Trend</h2>
-      {token_trend}
-    </div>
-  </section>
-  <section class="split">
-    <div>
-      <h2>Suites</h2>
-      <table>
-        <thead><tr><th>Suite</th><th>Total</th><th>Passed</th><th>Pass rate</th><th>Avg latency ms</th></tr></thead>
-        <tbody>
-{suite_rows}
-        </tbody>
-      </table>
-      <h2 style="margin-top:18px;">Token Counts</h2>
-      <table>
-        <thead><tr><th>Token count</th><th>Total</th><th>Passed</th><th>Pass rate</th><th>Avg latency ms</th></tr></thead>
-        <tbody>
-{token_rows}
-        </tbody>
-      </table>
-    </div>
-    <div>
-      <h2>Failure Groups</h2>
-      <table>
-        <thead><tr><th>Group</th><th>Count</th></tr></thead>
-        <tbody>
-{failure_rows}
-        </tbody>
-      </table>
-    </div>
-  </section>
-  <table>
-    <thead><tr><th>ID</th><th>Suite</th><th>Token count</th><th>Model</th><th>Status</th><th>Attempts</th><th>Latency ms</th><th>Input tokens</th><th>HTTP</th><th>Request ID</th><th>Rate remaining</th><th>Rate reset</th><th>Error kind</th><th>Answer</th><th>Error</th></tr></thead>
-    <tbody>
-{rows}
-    </tbody>
-  </table>
-</main>
-</body>
-</html>
-"#
-    );
+    let view = ReportView {
+        total: summary.total,
+        passed: summary.passed,
+        pass_rate_fmt: format!("{:.1}", summary.pass_rate),
+        avg_latency_ms: summary.avg_latency_ms,
+        latency_trend,
+        token_trend,
+        suite_rows: &summary.suites,
+        token_counts: &summary.token_counts,
+        position_rows: &summary.positions,
+        failure_groups: &summary.failure_groups,
+        results: result_rows,
+    };
 
+    let html = view.render().context("failed to render report template")?;
     fs::write(out_path, html).with_context(|| format!("failed to write report {out_path}"))?;
     Ok(())
 }
@@ -241,6 +205,16 @@ fn build_summary(results: &[BenchmarkResult]) -> ReportSummary {
                 .map(|token_count| token_count.to_string())
                 .unwrap_or_else(|| "unknown".to_string())
         }),
+        positions: render_aggregate_summary(results, |result| {
+            result
+                .metadata
+                .get("position_label")
+                .cloned()
+                .unwrap_or_default()
+        })
+        .into_iter()
+        .filter(|agg| !agg.label.is_empty())
+        .collect(),
         failure_groups: render_failure_summary(results),
     }
 }
@@ -278,6 +252,7 @@ where
                 total,
                 passed,
                 pass_rate,
+                pass_rate_fmt: format!("{:.1}", pass_rate),
                 avg_latency_ms,
             }
         })
@@ -295,97 +270,6 @@ fn render_failure_summary(results: &[BenchmarkResult]) -> Vec<FailureGroupSummar
         .into_iter()
         .map(|(label, count)| FailureGroupSummary { label, count })
         .collect()
-}
-
-fn escape_html(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
-
-fn render_suite_rows(results: &[BenchmarkResult]) -> String {
-    let mut suites: BTreeMap<String, (usize, usize, u64)> = BTreeMap::new();
-    for result in results {
-        let suite = result
-            .suite
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
-        let entry = suites.entry(suite).or_insert((0, 0, 0));
-        entry.0 += 1;
-        if result.passed {
-            entry.1 += 1;
-        }
-        entry.2 += result.latency_ms;
-    }
-
-    suites
-        .into_iter()
-        .map(|(suite, (total, passed, latency_sum))| {
-            let pass_rate = if total == 0 {
-                0.0
-            } else {
-                (passed as f64 / total as f64) * 100.0
-            };
-            let avg_latency = if total == 0 {
-                0
-            } else {
-                latency_sum / total as u64
-            };
-            format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{:.1}%</td><td>{}</td></tr>",
-                escape_html(&suite),
-                total,
-                passed,
-                pass_rate,
-                avg_latency
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn render_token_rows(results: &[BenchmarkResult]) -> String {
-    let mut tokens: BTreeMap<String, (usize, usize, u64)> = BTreeMap::new();
-    for result in results {
-        let token_key = result
-            .token_count
-            .map(|token_count| token_count.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        let entry = tokens.entry(token_key).or_insert((0, 0, 0));
-        entry.0 += 1;
-        if result.passed {
-            entry.1 += 1;
-        }
-        entry.2 += result.latency_ms;
-    }
-
-    tokens
-        .into_iter()
-        .map(|(token_count, (total, passed, latency_sum))| {
-            let pass_rate = if total == 0 {
-                0.0
-            } else {
-                (passed as f64 / total as f64) * 100.0
-            };
-            let avg_latency = if total == 0 {
-                0
-            } else {
-                latency_sum / total as u64
-            };
-            format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{:.1}%</td><td>{}</td></tr>",
-                escape_html(&token_count),
-                total,
-                passed,
-                pass_rate,
-                avg_latency
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn render_line_chart(values: &[f64], color: &str) -> String {
@@ -441,33 +325,9 @@ fn render_line_chart(values: &[f64], color: &str) -> String {
 </svg>"##,
         points.join(" "),
         circles.join("\n  "),
-        escape_html(&min_label),
-        escape_html(&max_label),
+        min_label,
+        max_label,
     )
-}
-
-fn render_failure_rows(results: &[BenchmarkResult]) -> String {
-    let mut groups: BTreeMap<String, usize> = BTreeMap::new();
-    for result in results.iter().filter(|result| !result.passed) {
-        let group = failure_group(result);
-        *groups.entry(group).or_insert(0) += 1;
-    }
-
-    if groups.is_empty() {
-        return "<tr><td colspan=\"2\">No failures</td></tr>".to_string();
-    }
-
-    groups
-        .into_iter()
-        .map(|(group, count)| {
-            format!(
-                "<tr><td>{}</td><td>{}</td></tr>",
-                escape_html(&group),
-                count
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn failure_group(result: &BenchmarkResult) -> String {
@@ -531,5 +391,75 @@ mod tests {
         assert_eq!(summary.token_counts.len(), 1);
         assert_eq!(summary.failure_groups[0].label, "Http");
         assert!(summary.to_json().unwrap().contains("failure_groups"));
+    }
+
+    #[test]
+    fn report_handles_empty_results_file() {
+        let tmp = tempdir().unwrap();
+        let results = tmp.path().join("results.jsonl");
+        let out = tmp.path().join("report.html");
+        fs::write(&results, "").unwrap();
+
+        generate_html(results.to_str().unwrap(), out.to_str().unwrap()).unwrap();
+        let html = fs::read_to_string(out).unwrap();
+        assert!(html.contains("Long Context Benchmark Report"));
+        assert!(html.contains(">0<"));
+    }
+
+    #[test]
+    fn line_chart_with_empty_values() {
+        let svg = render_line_chart(&[], "#2563eb");
+        assert!(svg.contains("No data"));
+    }
+
+    #[test]
+    fn line_chart_with_single_value() {
+        let svg = render_line_chart(&[42.0], "#2563eb");
+        assert!(svg.contains("svg"));
+        assert!(svg.contains("42"));
+    }
+
+    #[test]
+    fn line_chart_with_all_same_values() {
+        let svg = render_line_chart(&[5.0, 5.0, 5.0], "#2563eb");
+        assert!(svg.contains("svg"));
+        assert!(svg.contains("5"));
+    }
+
+    #[test]
+    fn failure_group_classifies_by_error_kind() {
+        let mut result = BenchmarkResult {
+            schema_version: 1,
+            suite: None,
+            token_count: None,
+            id: "test".to_string(),
+            provider_model: None,
+            provider_base_url: None,
+            http_status: None,
+            request_id: None,
+            rate_limit_remaining: None,
+            rate_limit_reset: None,
+            passed: false,
+            attempts: 1,
+            latency_ms: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            answer: None,
+            error: None,
+            error_kind: Some(crate::benchmark::ErrorKind::Http),
+            judge_latency_ms: None,
+            judge_input_tokens: None,
+            metadata: BTreeMap::new(),
+        };
+        assert_eq!(failure_group(&result), "Http");
+
+        result.error_kind = Some(crate::benchmark::ErrorKind::Transport);
+        assert_eq!(failure_group(&result), "Transport");
+
+        result.error_kind = None;
+        assert_eq!(failure_group(&result), "Grading");
+
+        result.passed = true;
+        assert_eq!(failure_group(&result), "Pass");
     }
 }

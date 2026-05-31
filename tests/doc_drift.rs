@@ -9,9 +9,24 @@ fn docs_cover_current_cli_and_config_surface() {
             "README.md should mention the {command} command"
         );
     }
+    for suite in [
+        "needle",
+        "multi-needle",
+        "conflict",
+        "multi-hop",
+        "order-dependent",
+        "position-sweep",
+        "hallucination",
+    ] {
+        assert!(
+            readme.contains(suite),
+            "README.md should mention the {suite} suite type"
+        );
+    }
     assert!(readme.contains("log_requests"));
     assert!(readme.contains("request_log_path"));
     assert!(readme.contains("request_style"));
+    assert!(readme.contains("judge_model"));
 
     let config = fs::read_to_string("docs/configuration.md")
         .expect("docs/configuration.md should be readable");
