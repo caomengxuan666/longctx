@@ -3,6 +3,7 @@ pub mod compare;
 pub mod context_index;
 pub mod generator;
 pub mod grader;
+pub mod probe;
 pub mod report;
 pub mod runner;
 pub mod tokenizer;

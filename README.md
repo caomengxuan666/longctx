@@ -63,6 +63,19 @@ Results are written to `./bench/results.jsonl`.
 By default, `run` refuses to overwrite an existing `results.jsonl`, `run.json`, or request log. Use `--force` when intentionally replacing prior output.
 Use `--dry-run` to validate config, select tests, and resolve `context = "auto"` without reading the API key, sending provider requests, or writing results. Use `--filter <text>` to select tests whose ID or suite contains the text, and `--limit <n>` to cap the selected set.
 
+### `probe-context`
+
+Automatically probe a provider's usable context boundary with generated needle tests. The command starts at `--min-tokens`, doubles until `--max-tokens` or the first failure, then binary-searches the success/failure boundary until it reaches `--resolution-tokens`.
+
+```sh
+longctx probe-context ./probe --config ./bench/config.toml
+longctx probe-context ./probe --config ./bench/config.toml --max-tokens 1000000 --resolution-tokens 8000
+longctx probe-context ./probe --config ./bench/config.toml --skip-capabilities
+longctx probe-context ./probe --config ./bench/config.toml --json
+```
+
+By default, the command also runs a 32K-token capability pass for `multi-needle`, `conflict`, `multi-hop`, `order-dependent`, `position-sweep`, and `hallucination`. Each token attempt is written as an ordinary benchmark directory under `probe-runs/`, with standard `contexts/`, `manifests/`, `results.jsonl`, `run.json`, and `reports/` outputs.
+
 ### `validate`
 
 Validate a benchmark directory before running it.
@@ -198,6 +211,8 @@ Each run also writes a `run.json` snapshot with config, timing metadata, and SHA
 When `run.log_requests` is enabled, redacted HTTP exchange logs are written to `reports/http-log.jsonl`.
 Reports default to `reports/report.html` next to the results file unless `--out` is provided.
 Direct context file paths in manifests must resolve under the benchmark directory. Absolute paths and `..` paths that escape the benchmark directory are rejected before provider requests are sent.
+
+`probe-context` writes timestamped probe runs under the selected output directory. Every individual probe attempt remains a standard benchmark directory, so existing `report`, `compare`, and result readers can inspect the generated artifacts.
 
 ## Automatic Context Routing
 

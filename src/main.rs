@@ -80,6 +80,35 @@ enum Commands {
         /// Benchmark directory containing manifests and contexts
         bench_dir: String,
     },
+    /// Automatically probe maximum usable context and optional capability suites
+    ProbeContext {
+        /// Probe output directory. Use --config or place config.toml here.
+        out_dir: String,
+        /// Config file to copy into each generated probe benchmark directory
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+        /// Initial token count for the exponential probe
+        #[arg(long, default_value_t = 8_000)]
+        min_tokens: u64,
+        /// Upper token count cap for the probe
+        #[arg(long, default_value_t = 1_000_000)]
+        max_tokens: u64,
+        /// Stop binary search when failure and success are within this many tokens
+        #[arg(long, default_value_t = 8_000)]
+        resolution_tokens: u64,
+        /// Seed for deterministic generated probe data
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Token count for the capability suite pass
+        #[arg(long, default_value_t = 32_000)]
+        capability_tokens: u64,
+        /// Skip multi-suite capability probing after max-context probing
+        #[arg(long)]
+        skip_capabilities: bool,
+        /// Print a machine-readable JSON summary
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -178,6 +207,33 @@ fn main() -> anyhow::Result<()> {
             let index = longctx::context_index::build_context_index(bench_path)?;
             longctx::context_index::write_context_index(bench_path, &index)?;
             println!("indexed {} contexts", index.contexts.len());
+        }
+        Commands::ProbeContext {
+            out_dir,
+            config,
+            min_tokens,
+            max_tokens,
+            resolution_tokens,
+            seed,
+            capability_tokens,
+            skip_capabilities,
+            json,
+        } => {
+            let options = longctx::probe::ProbeOptions {
+                min_tokens,
+                max_tokens,
+                resolution_tokens,
+                seed,
+                config_path: config,
+                capability_tokens: (!skip_capabilities).then_some(capability_tokens),
+            };
+            let rt = tokio::runtime::Runtime::new()?;
+            let summary = rt.block_on(longctx::probe::probe_context(&out_dir, options))?;
+            if json {
+                println!("{}", summary.to_json()?);
+            } else {
+                print!("{}", summary.render());
+            }
         }
     }
     Ok(())

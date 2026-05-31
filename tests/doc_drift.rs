@@ -12,7 +12,15 @@ fn docs_cover_current_cli_and_config_surface() {
     assert!(license.contains("MIT License"));
 
     let readme = fs::read_to_string("README.md").expect("README.md should be readable");
-    for command in ["generate", "run", "validate", "report", "compare", "index"] {
+    for command in [
+        "generate",
+        "run",
+        "validate",
+        "report",
+        "compare",
+        "index",
+        "probe-context",
+    ] {
         assert!(
             readme.contains(command),
             "README.md should mention the {command} command"
@@ -52,6 +60,8 @@ fn docs_cover_current_cli_and_config_surface() {
     assert!(readme.contains("cargo install longctx"));
     assert!(readme.contains("SHA256"));
     assert!(readme.contains("MIT License"));
+    assert!(readme.contains("resolution-tokens"));
+    assert!(readme.contains("skip-capabilities"));
 
     let config = fs::read_to_string("docs/configuration.md")
         .expect("docs/configuration.md should be readable");
@@ -71,6 +81,8 @@ fn docs_cover_current_cli_and_config_surface() {
     assert!(config.contains("Context file safety"));
     assert!(config.contains("Result durability"));
     assert!(config.contains("SHA256 fingerprints"));
+    assert!(config.contains("probe-context"));
+    assert!(config.contains("probe-summary.json"));
 
     let roadmap = fs::read_to_string("docs/productionization.md")
         .expect("docs/productionization.md should be readable");

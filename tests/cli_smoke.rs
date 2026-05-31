@@ -187,6 +187,19 @@ fn cli_generate_invalid_suite_has_no_filesystem_side_effects() {
 }
 
 #[test]
+fn cli_probe_context_help_is_available() {
+    let help = assert_success(
+        longctx()
+            .args(["probe-context", "--help"])
+            .output()
+            .unwrap(),
+    );
+    assert!(help.contains("Automatically probe"));
+    assert!(help.contains("--resolution-tokens"));
+    assert!(help.contains("--skip-capabilities"));
+}
+
+#[test]
 fn cli_report_and_compare_outputs() {
     let tmp = tempdir().unwrap();
     let baseline = tmp.path().join("baseline.jsonl");

@@ -50,6 +50,7 @@ The next work should make the loop dependable enough for repeat use.
 - CI coverage for Linux stable, MSRV 1.86, and platform tests for macOS and Windows.
 - Tag-based release automation with test gates, target-named archives, SHA256 checksums, and GitHub Release assets.
 - MIT license metadata and root `LICENSE` file for crate publication.
+- Automated context-window probing with exponential search, binary boundary refinement, and optional capability suites.
 
 ## Next priorities
 
