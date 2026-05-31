@@ -41,6 +41,7 @@ The next work should make the loop dependable enough for repeat use.
 - Result reader guards for unsupported future schema versions and duplicate comparison IDs.
 - Structured LLM judge failure reporting with judge status, attempts, token, latency, and error metadata.
 - LLM judge retry/backoff behavior aligned with benchmark provider requests.
+- LLM judge support for both chat-completions and responses provider request styles.
 - Dry-run, filter, and limit controls for targeted benchmark execution.
 - Durable result writes that flush each completed row during long runs.
 - Token-suffixed generated manifests and contexts so token sweeps do not overwrite earlier suites.

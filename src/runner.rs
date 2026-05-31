@@ -661,6 +661,7 @@ async fn run_one(
                     &provider.base_url,
                     api_key,
                     judge_model,
+                    provider.request_style,
                     run.request_timeout_secs,
                     run.max_retries,
                     run.retry_backoff_ms,
@@ -2206,7 +2207,7 @@ model = "example-model"
             .and(body_string_contains("slow question"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_delay(Duration::from_millis(1_500))
+                    .set_delay(Duration::from_millis(5_000))
                     .set_body_json(serde_json::json!({
                         "choices": [{"message": {"role": "assistant", "content": "SLOW"}}],
                         "usage": {"prompt_tokens": 10, "completion_tokens": 1}
@@ -2278,8 +2279,14 @@ model = "example-model"
             .unwrap()
         });
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let partial = fs::read_to_string(&results_path).unwrap();
+        let mut partial = String::new();
+        for _ in 0..40 {
+            partial = fs::read_to_string(&results_path).unwrap_or_default();
+            if partial.contains("\"id\":\"fast\"") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert!(partial.contains("\"id\":\"fast\""));
         assert!(!partial.contains("\"id\":\"slow\""));
 
@@ -2467,6 +2474,91 @@ retry_backoff_ms = 1
         assert_eq!(result.judge_attempts, Some(2));
         assert_eq!(result.judge_http_status, Some(200));
         assert_eq!(result.judge_error, None);
+    }
+
+    #[tokio::test]
+    async fn run_uses_responses_style_for_llm_judge_when_configured() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(body_string_contains("Use the context to answer"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output_text": "candidate answer",
+                "usage": {"input_tokens": 20, "output_tokens": 2}
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(body_string_contains("You are grading an answer"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output_text": "CORRECT",
+                "usage": {"input_tokens": 10, "output_tokens": 1}
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("contexts")).unwrap();
+        fs::create_dir_all(tmp.path().join("manifests")).unwrap();
+        fs::write(tmp.path().join("contexts/test.txt"), "context").unwrap();
+        fs::write(
+            tmp.path().join("config.toml"),
+            format!(
+                r#"
+[provider]
+base_url = "{}"
+api_key_env = "LONGCTX_JUDGE_RESPONSES_TEST_KEY"
+model = "test-model"
+request_style = "responses"
+"#,
+                mock_server.uri()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("manifests/judge.json"),
+            r#"
+{
+  "schema_version": 1,
+  "name": "judge",
+  "token_count": 100,
+  "seed": 7,
+  "suites": [{
+    "schema_version": 1,
+    "id": "judge-1",
+    "context": "contexts/test.txt",
+    "question": "q",
+    "expected": ["candidate answer"],
+    "grader": "LlmJudge",
+    "metadata": {"suite": "judge", "token_count": "100"}
+  }]
+}
+"#,
+        )
+        .unwrap();
+        std::env::set_var("LONGCTX_JUDGE_RESPONSES_TEST_KEY", "test-key");
+
+        run_benchmarks_with_options(
+            tmp.path().to_str().unwrap(),
+            RunOptions {
+                force: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let result_line = fs::read_to_string(tmp.path().join("results.jsonl")).unwrap();
+        let result: BenchmarkResult = serde_json::from_str(&result_line).unwrap();
+        assert!(result.passed);
+        assert_eq!(result.judge_http_status, Some(200));
+        assert_eq!(result.judge_attempts, Some(1));
+        assert_eq!(result.judge_input_tokens, Some(10));
+        assert_eq!(result.judge_output_tokens, Some(1));
     }
 
     #[tokio::test]

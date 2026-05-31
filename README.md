@@ -180,7 +180,7 @@ The config also supports an optional `[grader]` section for LLM-as-judge grading
 judge_model = "gpt-4.1-mini"  # optional, defaults to the same provider model
 ```
 
-When a test case uses `Grader::LlmJudge`, the runner sends the answer to the judge model for evaluation instead of using exact string matching. Judge requests use the same retry, backoff, and timeout controls as benchmark provider requests. Judge failures are reported separately with `error_kind = "Judge"` and include judge HTTP status, attempts, latency, token counts, and error text in the result row.
+When a test case uses `Grader::LlmJudge`, the runner sends the answer to the judge model for evaluation instead of using exact string matching. Judge requests use the configured provider request style plus the same retry, backoff, and timeout controls as benchmark provider requests. Judge failures are reported separately with `error_kind = "Judge"` and include judge HTTP status, attempts, latency, token counts, and error text in the result row.
 
 Any provider that exposes an OpenAI-compatible `/chat/completions` endpoint can be used by changing `base_url`, `api_key_env`, and `model`.
 

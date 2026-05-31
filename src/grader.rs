@@ -1,4 +1,4 @@
-use crate::benchmark::{Grader, TestCase};
+use crate::benchmark::{Grader, ProviderRequestStyle, TestCase};
 use crate::tokenizer::TokenCounter;
 use regex::Regex;
 use std::time::{Duration, Instant};
@@ -147,6 +147,7 @@ pub async fn grade_with_llm(
     base_url: &str,
     api_key: &str,
     model: &str,
+    request_style: ProviderRequestStyle,
     timeout_secs: u64,
     max_retries: u32,
     retry_backoff_ms: u64,
@@ -166,13 +167,24 @@ pub async fn grade_with_llm(
     let input_tokens = counter.count_tokens(&prompt);
     let started = Instant::now();
 
-    let body = serde_json::json!({
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.0,
-    });
-
-    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let (url, body) = match request_style {
+        ProviderRequestStyle::ChatCompletions => (
+            format!("{}/chat/completions", base_url.trim_end_matches('/')),
+            serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0,
+            }),
+        ),
+        ProviderRequestStyle::Responses => (
+            format!("{}/responses", base_url.trim_end_matches('/')),
+            serde_json::json!({
+                "model": model,
+                "input": prompt,
+                "temperature": 0.0,
+            }),
+        ),
+    };
     let max_attempts = max_retries.saturating_add(1).max(1);
     let mut attempts = 0;
 
@@ -240,21 +252,36 @@ pub async fn grade_with_llm(
         };
     };
 
-    let judge_answer = json
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
+    let judge_answer = match request_style {
+        ProviderRequestStyle::ChatCompletions => json
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string(),
+        ProviderRequestStyle::Responses => responses_answer_from_value(&json).unwrap_or_default(),
+    };
 
     let upper = judge_answer.to_uppercase();
     let passed = upper.contains("CORRECT") && !upper.contains("INCORRECT");
+    let input_tokens = json
+        .get("usage")
+        .and_then(|usage| match request_style {
+            ProviderRequestStyle::ChatCompletions => usage.get("prompt_tokens"),
+            ProviderRequestStyle::Responses => usage.get("input_tokens"),
+        })
+        .and_then(|tokens| tokens.as_u64())
+        .unwrap_or(input_tokens);
     let output_tokens = json
         .get("usage")
-        .and_then(|usage| usage.get("completion_tokens"))
+        .and_then(|usage| match request_style {
+            ProviderRequestStyle::ChatCompletions => usage.get("completion_tokens"),
+            ProviderRequestStyle::Responses => usage.get("output_tokens"),
+        })
         .and_then(|tokens| tokens.as_u64())
-        .unwrap_or_else(|| counter.count_tokens(judge_answer));
+        .unwrap_or_else(|| counter.count_tokens(&judge_answer));
 
     LlmJudgeResult {
         passed,
@@ -265,6 +292,37 @@ pub async fn grade_with_llm(
         attempts,
         error: None,
     }
+}
+
+fn responses_answer_from_value(json: &serde_json::Value) -> Option<String> {
+    if let Some(text) = json
+        .get("output_text")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(text.to_string());
+    }
+    json.get("output")
+        .and_then(|output| output.as_array())
+        .and_then(|items| {
+            items
+                .iter()
+                .flat_map(|item| {
+                    item.get("content")
+                        .and_then(|content| content.as_array())
+                        .into_iter()
+                        .flatten()
+                })
+                .find_map(|content| {
+                    content
+                        .get("text")
+                        .and_then(|text| text.as_str())
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .map(str::to_string)
+                })
+        })
 }
 
 fn is_retryable_status(status: reqwest::StatusCode) -> bool {
