@@ -8,8 +8,16 @@ Design and configuration notes live in [docs/configuration.md](docs/configuratio
 
 ## Install
 
+Minimum supported Rust version: 1.81.
+
 ```sh
 cargo install --git https://github.com/LibSkills/longctx.git
+```
+
+Tagged releases publish platform archives for Linux, macOS, and Windows with SHA256 checksum files. After a crates.io release exists, install with:
+
+```sh
+cargo install longctx
 ```
 
 ## Commands

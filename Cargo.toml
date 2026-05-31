@@ -8,6 +8,7 @@ readme = "README.md"
 repository = "https://github.com/LibSkills/longctx"
 keywords = ["llm", "benchmark", "long-context", "cli"]
 categories = ["command-line-utilities", "development-tools::testing"]
+exclude = [".codex.toml", "/report.html"]
 
 [dependencies]
 clap = { features = ["derive"], version = "4" }

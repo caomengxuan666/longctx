@@ -2,6 +2,11 @@ use std::fs;
 
 #[test]
 fn docs_cover_current_cli_and_config_surface() {
+    let cargo_toml = fs::read_to_string("Cargo.toml").expect("Cargo.toml should be readable");
+    assert!(cargo_toml.contains("rust-version = \"1.81\""));
+    assert!(cargo_toml.contains("\"/report.html\""));
+    assert!(cargo_toml.contains("\".codex.toml\""));
+
     let readme = fs::read_to_string("README.md").expect("README.md should be readable");
     for command in ["generate", "run", "validate", "report", "compare", "index"] {
         assert!(
@@ -34,6 +39,9 @@ fn docs_cover_current_cli_and_config_surface() {
     assert!(readme.contains("--dry-run"));
     assert!(readme.contains("--filter"));
     assert!(readme.contains("benchmark directory"));
+    assert!(readme.contains("Minimum supported Rust version: 1.81"));
+    assert!(readme.contains("cargo install longctx"));
+    assert!(readme.contains("SHA256"));
 
     let config = fs::read_to_string("docs/configuration.md")
         .expect("docs/configuration.md should be readable");
@@ -52,4 +60,6 @@ fn docs_cover_current_cli_and_config_surface() {
         .expect("docs/productionization.md should be readable");
     assert!(roadmap.contains("schema_version"));
     assert!(roadmap.contains("request IDs"));
+    assert!(roadmap.contains("license"));
+    assert!(roadmap.contains("MSRV 1.81"));
 }

@@ -50,8 +50,13 @@ The next work should make the loop dependable enough for repeat use.
 
 ### P1
 
-- No remaining P1 items.
+- Decide and add the project license before publishing to crates.io.
+- Keep release automation attached to `v*` tags with test gates, target-named archives, SHA256 checksums, and GitHub Release assets.
+- Keep CI coverage on Linux stable, MSRV 1.81, and platform tests for macOS and Windows.
+- Add durable streaming result writes so completed rows survive an interrupted long run.
 
 ### P2
 
-- No remaining P2 items.
+- Decide whether crates.io publishing is manual or automated.
+- Add artifact fingerprints to `run.json` for stronger reproducibility audits.
+- Consider moving the default `report` output under `bench/reports/` while preserving explicit `--out` behavior.
