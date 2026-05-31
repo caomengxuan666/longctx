@@ -46,9 +46,11 @@ Run generated benchmark cases against an OpenAI-compatible provider. The benchma
 
 ```sh
 longctx run ./bench
+longctx run ./bench --force
 ```
 
 Results are written to `./bench/results.jsonl`.
+By default, `run` refuses to overwrite an existing `results.jsonl` or request log. Use `--force` when intentionally replacing prior output.
 
 ### `validate`
 
@@ -68,7 +70,7 @@ Build or refresh the context index used by automatic context routing.
 longctx index ./bench
 ```
 
-Generated suites write this index automatically. Run `index` after hand-editing manifests or context files.
+Generated suites write this index automatically with deterministic metadata for reproducible benchmark data. Run `index` after hand-editing manifests or context files.
 
 ### `report`
 
@@ -156,7 +158,7 @@ Fields:
 - `concurrency`: Number of benchmark requests to run in parallel.
 - `request_style`: Provider request style, either `chat-completions` or `responses`.
 - `log_requests`: Write opt-in redacted HTTP exchange logs under `reports/`.
-- `request_log_path`: Path for the request log file, defaulting to `reports/http-log.jsonl`.
+- `request_log_path`: Relative path under `reports/` for the request log file, defaulting to `reports/http-log.jsonl`.
 
 The config also supports an optional `[grader]` section for LLM-as-judge grading:
 
@@ -178,7 +180,7 @@ Each generated suite writes:
 - A context routing index at `context.index.json`.
 
 The runner accepts generated suite manifests and writes newline-delimited JSON results to `results.jsonl`.
-Result rows include the suite name, token count, provider model, HTTP status, provider request ID, rate-limit headers, attempt count, structured error kind when a run fails, and optional routing audit details.
+Result rows include the suite name, token count, provider model, HTTP status, provider request ID, rate-limit headers, attempt count, structured error kind when a run fails, and optional routing audit details. Readers reject result rows with a newer unsupported `schema_version`, and `compare` rejects duplicate result IDs.
 Each run also writes a `run.json` snapshot with config and timing metadata.
 When `run.log_requests` is enabled, redacted HTTP exchange logs are written to `reports/http-log.jsonl`.
 
@@ -186,9 +188,10 @@ When `run.log_requests` is enabled, redacted HTTP exchange logs are written to `
 
 Set a test case's `context = "auto"` to let the runner select a context file from `context.index.json` instead of naming a file directly.
 
-The first implementation is a zero-token local router. It scores context-level index entries using safe manifest metadata, test IDs, suite names, token counts, and lexical overlap with the question. It does not call an LLM router and does not inspect `expected` answers. If routing is ambiguous, the result fails with `error_kind = "ContextRoute"` instead of silently choosing a weak candidate.
+The first implementation is a zero-token local router. It scores context-level index entries using safe manifest metadata, test IDs, suite names, token counts, and lexical overlap with the question. It does not call an LLM router and does not inspect `expected` answers. If routing is ambiguous or top candidates tie, the result fails with `error_kind = "ContextRoute"` instead of silently choosing a weak candidate.
 
 Routing decisions are written into each result row under `routing`, including selected context path, candidate scores, method, status, confidence, token usage, and latency fields. The token and latency fields are currently zero because the local router does not spend model tokens.
+Existing `context.index.json` files are validated during `run`; stale hashes, unsupported schema versions, absolute paths, and paths escaping the benchmark directory are rejected before provider requests are sent.
 
 ## Contributing
 

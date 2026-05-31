@@ -36,6 +36,9 @@ The next work should make the loop dependable enough for repeat use.
 - Provider-specific adapters for chat completions and responses APIs.
 - Zero-token automatic context routing with a reproducible `context.index.json`.
 - Per-result routing audit metadata and report columns for routed runs.
+- Run preflight validation, duplicate test ID rejection, and output overwrite protection.
+- Runtime context index validation for stale hashes and path escape attempts.
+- Result reader guards for unsupported future schema versions and duplicate comparison IDs.
 
 ## Next priorities
 

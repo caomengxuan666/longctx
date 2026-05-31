@@ -29,3 +29,8 @@ jobs:
 
       - name: Build
         run: cargo build --locked
+
+      - name: Install smoke
+        run: |
+          cargo install --path . --locked
+          longctx --help

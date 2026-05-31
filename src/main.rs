@@ -27,6 +27,9 @@ enum Commands {
     Run {
         /// Benchmark directory containing config.toml and test cases
         bench_dir: String,
+        /// Overwrite existing results and request log files
+        #[arg(long)]
+        force: bool,
     },
     /// Generate HTML report from results
     Report {
@@ -81,9 +84,12 @@ fn main() -> anyhow::Result<()> {
         } => {
             longctx::generator::generate(&suite, tokens, seed, &out)?;
         }
-        Commands::Run { bench_dir } => {
+        Commands::Run { bench_dir, force } => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(longctx::runner::run_benchmarks(&bench_dir))?;
+            rt.block_on(longctx::runner::run_benchmarks_with_options(
+                &bench_dir,
+                longctx::runner::RunOptions { force },
+            ))?;
         }
         Commands::Report { results, out, json } => {
             if json {

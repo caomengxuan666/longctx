@@ -5,8 +5,9 @@ use crate::context_index::{
 };
 use crate::runner::{read_config, read_tests};
 use anyhow::{bail, Context, Result};
+use std::collections::BTreeSet;
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationSummary {
@@ -25,14 +26,28 @@ pub fn validate_benchmark_dir(bench_dir: &str, check_api_key: bool) -> Result<Va
     }
 
     let config = read_config(&bench_path.join("config.toml"))?;
-    validate_config(&config, check_api_key)?;
-
     let tests = read_tests(bench_path)?;
     if tests.is_empty() {
         bail!("no benchmark tests found in {}", bench_path.display());
     }
+    validate_loaded_benchmark(bench_path, &config, &tests, check_api_key)?;
 
-    for test in &tests {
+    Ok(ValidationSummary {
+        test_count: tests.len(),
+        config_model: config.provider.model,
+        api_key_checked: check_api_key,
+    })
+}
+
+pub(crate) fn validate_loaded_benchmark(
+    bench_path: &Path,
+    config: &Config,
+    tests: &[TestCase],
+    check_api_key: bool,
+) -> Result<()> {
+    validate_config(config, check_api_key)?;
+    validate_unique_test_ids(tests)?;
+    for test in tests {
         validate_test(bench_path, test)?;
     }
     if tests.iter().any(|test| is_auto_context(&test.context)) {
@@ -45,15 +60,10 @@ pub fn validate_benchmark_dir(bench_dir: &str, check_api_key: bool) -> Result<Va
             validate_context_index(bench_path, &index)?;
         }
     }
-
-    Ok(ValidationSummary {
-        test_count: tests.len(),
-        config_model: config.provider.model,
-        api_key_checked: check_api_key,
-    })
+    Ok(())
 }
 
-fn validate_config(config: &Config, check_api_key: bool) -> Result<()> {
+pub(crate) fn validate_config(config: &Config, check_api_key: bool) -> Result<()> {
     if config.schema_version > SCHEMA_VERSION {
         bail!(
             "config schema_version {} is newer than supported schema_version {}",
@@ -76,6 +86,7 @@ fn validate_config(config: &Config, check_api_key: bool) -> Result<()> {
     if config.run.concurrency == 0 {
         bail!("run.concurrency must be greater than 0");
     }
+    validate_request_log_path(&config.run.request_log_path)?;
     if check_api_key {
         env::var(&config.provider.api_key_env).with_context(|| {
             format!(
@@ -87,7 +98,7 @@ fn validate_config(config: &Config, check_api_key: bool) -> Result<()> {
     Ok(())
 }
 
-fn validate_test(bench_dir: &Path, test: &TestCase) -> Result<()> {
+pub(crate) fn validate_test(bench_dir: &Path, test: &TestCase) -> Result<()> {
     if test.schema_version > SCHEMA_VERSION {
         bail!(
             "test {} schema_version {} is newer than supported schema_version {}",
@@ -114,6 +125,36 @@ fn validate_test(bench_dir: &Path, test: &TestCase) -> Result<()> {
             test.id,
             test.context
         );
+    }
+    Ok(())
+}
+
+fn validate_unique_test_ids(tests: &[TestCase]) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for test in tests {
+        if !seen.insert(test.id.as_str()) {
+            bail!("duplicate test id: {}", test.id);
+        }
+    }
+    Ok(())
+}
+
+fn validate_request_log_path(path: &str) -> Result<()> {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        bail!("run.request_log_path must be relative and stay under reports/");
+    }
+    let mut components = path.components();
+    if components.next() != Some(Component::Normal("reports".as_ref())) {
+        bail!("run.request_log_path must stay under reports/");
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        bail!("run.request_log_path must not escape reports/");
     }
     Ok(())
 }
@@ -280,6 +321,69 @@ concurrency = 0
 
         let error = validate_benchmark_dir(tmp.path().to_str().unwrap(), false).unwrap_err();
         assert!(error.to_string().contains("concurrency"));
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_test_ids() {
+        let tmp = tempdir().unwrap();
+        write_valid_fixture(tmp.path());
+        fs::write(
+            tmp.path().join("manifests/needle.json"),
+            r#"
+{
+  "schema_version": 1,
+  "name": "needle",
+  "token_count": 100,
+  "seed": 7,
+  "suites": [
+    {
+      "schema_version": 1,
+      "id": "duplicate",
+      "context": "contexts/needle_context.txt",
+      "question": "q1",
+      "expected": ["a"],
+      "grader": "Exact",
+      "metadata": {"suite": "needle"}
+    },
+    {
+      "schema_version": 1,
+      "id": "duplicate",
+      "context": "contexts/needle_context.txt",
+      "question": "q2",
+      "expected": ["a"],
+      "grader": "Exact",
+      "metadata": {"suite": "needle"}
+    }
+  ]
+}
+"#,
+        )
+        .unwrap();
+
+        let error = validate_benchmark_dir(tmp.path().to_str().unwrap(), false).unwrap_err();
+        assert!(error.to_string().contains("duplicate test id"));
+    }
+
+    #[test]
+    fn validate_rejects_request_log_path_outside_reports() {
+        let tmp = tempdir().unwrap();
+        write_valid_fixture(tmp.path());
+        fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[provider]
+base_url = "https://api.example.test/v1"
+api_key_env = "EXAMPLE_API_KEY"
+model = "example-model"
+
+[run]
+request_log_path = "../http-log.jsonl"
+"#,
+        )
+        .unwrap();
+
+        let error = validate_benchmark_dir(tmp.path().to_str().unwrap(), false).unwrap_err();
+        assert!(error.to_string().contains("request_log_path"));
     }
 
     #[test]

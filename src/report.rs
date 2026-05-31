@@ -1,4 +1,4 @@
-use crate::benchmark::BenchmarkResult;
+use crate::benchmark::{BenchmarkResult, SCHEMA_VERSION};
 use anyhow::{Context, Result};
 use askama::Template;
 use serde::Serialize;
@@ -184,6 +184,14 @@ fn read_results(results_path: &str) -> Result<Vec<BenchmarkResult>> {
         }
         let result = serde_json::from_str::<BenchmarkResult>(line)
             .with_context(|| format!("failed to parse JSONL line {}", idx + 1))?;
+        if result.schema_version > SCHEMA_VERSION {
+            anyhow::bail!(
+                "results file schema_version {} on line {} is newer than supported schema_version {}",
+                result.schema_version,
+                idx + 1,
+                SCHEMA_VERSION
+            );
+        }
         results.push(result);
     }
     Ok(results)
@@ -438,6 +446,21 @@ mod tests {
         let html = fs::read_to_string(out).unwrap();
         assert!(html.contains("Long Context Benchmark Report"));
         assert!(html.contains(">0<"));
+    }
+
+    #[test]
+    fn report_rejects_newer_result_schema_version() {
+        let tmp = tempdir().unwrap();
+        let results = tmp.path().join("results.jsonl");
+        fs::write(
+            &results,
+            r#"{"schema_version":999,"id":"a","passed":true,"latency_ms":1,"input_tokens":1,"output_tokens":1,"answer":"A","error":null}
+"#,
+        )
+        .unwrap();
+
+        let error = generate_summary(results.to_str().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("newer than supported"));
     }
 
     #[test]

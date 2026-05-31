@@ -1,5 +1,5 @@
 use crate::benchmark::{Grader, SuiteManifest, TestCase, SCHEMA_VERSION};
-use crate::context_index::{build_context_index, write_context_index};
+use crate::context_index::{build_reproducible_context_index, write_context_index};
 use crate::tokenizer::TokenCounter;
 use anyhow::{bail, Context, Result};
 use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
@@ -60,7 +60,7 @@ pub fn generate(
     let json = serde_json::to_string_pretty(&manifest)?;
     fs::write(&manifest_path, json)
         .with_context(|| format!("failed to write manifest {}", manifest_path.display()))?;
-    let index = build_context_index(out_dir)?;
+    let index = build_reproducible_context_index(out_dir)?;
     write_context_index(out_dir, &index)?;
     Ok(())
 }
@@ -524,6 +524,8 @@ mod tests {
 
         let manifest_a = fs::read_to_string(tmp_a.path().join("manifests/needle.json")).unwrap();
         let manifest_b = fs::read_to_string(tmp_b.path().join("manifests/needle.json")).unwrap();
+        let index_a = fs::read_to_string(tmp_a.path().join("context.index.json")).unwrap();
+        let index_b = fs::read_to_string(tmp_b.path().join("context.index.json")).unwrap();
 
         let parsed_a: SuiteManifest = serde_json::from_str(&manifest_a).unwrap();
         let parsed_b: SuiteManifest = serde_json::from_str(&manifest_b).unwrap();
@@ -531,6 +533,8 @@ mod tests {
         assert_eq!(parsed_a.name, parsed_b.name);
         assert_eq!(parsed_a.suites[0].expected, parsed_b.suites[0].expected);
         assert_eq!(manifest_a, manifest_b);
+        assert_eq!(index_a, index_b);
+        assert!(index_a.contains("\"created_at_unix_ms\": 0"));
     }
 
     #[test]

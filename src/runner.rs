@@ -3,10 +3,12 @@ use crate::benchmark::{
     RunMetadata, SuiteManifest, TestCase, SCHEMA_VERSION,
 };
 use crate::context_index::{
-    is_auto_context, load_or_build_context_index, route_context, write_context_index, ContextIndex,
+    is_auto_context, load_or_build_context_index, route_context, validate_context_index,
+    write_context_index, ContextIndex,
 };
 use crate::grader::{grade, grade_with_llm};
 use crate::tokenizer::TokenCounter;
+use crate::validator::validate_loaded_benchmark;
 use anyhow::{anyhow, Context, Result};
 use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
@@ -22,8 +24,23 @@ use tokio::time::sleep;
 use walkdir::WalkDir;
 
 pub async fn run_benchmarks(bench_dir: &str) -> Result<()> {
+    run_benchmarks_with_options(bench_dir, RunOptions::default()).await
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunOptions {
+    pub force: bool,
+}
+
+pub async fn run_benchmarks_with_options(bench_dir: &str, options: RunOptions) -> Result<()> {
     let bench_path = Path::new(bench_dir);
     let config = read_config(&bench_path.join("config.toml"))?;
+    let tests = read_tests(bench_path)?;
+    if tests.is_empty() {
+        return Err(anyhow!("no benchmark .json files found in {bench_dir}"));
+    }
+    validate_loaded_benchmark(bench_path, &config, &tests, false)?;
+
     let api_key = env::var(&config.provider.api_key_env).with_context(|| {
         format!(
             "environment variable {} is not set",
@@ -31,12 +48,9 @@ pub async fn run_benchmarks(bench_dir: &str) -> Result<()> {
         )
     })?;
 
-    let tests = read_tests(bench_path)?;
-    if tests.is_empty() {
-        return Err(anyhow!("no benchmark .json files found in {bench_dir}"));
-    }
     let context_index = if tests.iter().any(|test| is_auto_context(&test.context)) {
         let index = load_or_build_context_index(bench_path)?;
+        validate_context_index(bench_path, &index)?;
         write_context_index(bench_path, &index)?;
         Some(index)
     } else {
@@ -45,6 +59,12 @@ pub async fn run_benchmarks(bench_dir: &str) -> Result<()> {
 
     let results_path = bench_path.join("results.jsonl");
     let metadata_path = bench_path.join("run.json");
+    let request_log_path = config
+        .run
+        .log_requests
+        .then(|| bench_path.join(&config.run.request_log_path));
+    ensure_output_paths_can_be_written(&results_path, request_log_path.as_deref(), options.force)?;
+
     let run_started = Instant::now();
     let started_at_unix_ms = unix_ms_now();
     let mut metadata = build_run_metadata(
@@ -85,14 +105,42 @@ pub async fn run_benchmarks(bench_dir: &str) -> Result<()> {
         writeln!(results_file, "{}", serde_json::to_string(&result)?)?;
     }
     if config.run.log_requests {
-        let log_path = bench_path.join(&config.run.request_log_path);
-        write_request_logs(bench_path, &log_path, &tests, &results)?;
+        let log_path = request_log_path
+            .as_deref()
+            .unwrap_or_else(|| Path::new(&config.run.request_log_path));
+        write_request_logs(bench_path, log_path, &tests, &results)?;
     }
     metadata.finished_at_unix_ms = Some(unix_ms_now());
     metadata.duration_ms = Some(run_started.elapsed().as_millis() as u64);
     write_run_metadata(&metadata_path, &metadata)?;
 
     Ok(())
+}
+
+fn ensure_output_paths_can_be_written(
+    results_path: &Path,
+    request_log_path: Option<&Path>,
+    force: bool,
+) -> Result<()> {
+    if force {
+        return Ok(());
+    }
+    if results_path.exists() {
+        bail_existing_output(results_path)?;
+    }
+    if let Some(path) = request_log_path {
+        if path.exists() {
+            bail_existing_output(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn bail_existing_output(path: &Path) -> Result<()> {
+    anyhow::bail!(
+        "refusing to overwrite existing output {}; rerun with --force to replace it",
+        path.display()
+    )
 }
 
 fn build_run_metadata(
@@ -151,15 +199,18 @@ fn write_request_logs(
         .with_context(|| format!("failed to open request log {}", log_path.display()))?;
 
     for (test, result) in tests.iter().zip(results.iter()) {
-        let context_path = result
-            .routing
-            .as_ref()
+        let routing = result.routing.as_ref();
+        let context_path = routing
             .and_then(|routing| routing.selected_context_path.as_deref())
             .unwrap_or(&test.context);
-        let request_hash = load_context(bench_path, context_path)
-            .map(|context| build_prompt(&context, &test.question))
-            .map(|prompt| sha256_hex(&prompt))
-            .ok();
+        let request_hash = if result.attempts > 0 {
+            load_context(bench_path, context_path)
+                .map(|context| build_prompt(&context, &test.question))
+                .map(|prompt| sha256_hex(&prompt))
+                .ok()
+        } else {
+            None
+        };
         let response_hash = result
             .answer
             .as_ref()
@@ -178,6 +229,10 @@ fn write_request_logs(
             output_tokens: result.output_tokens,
             passed: result.passed,
             error_kind: result.error_kind.clone(),
+            routing_status: routing.map(|routing| routing.status.clone()),
+            routing_reason: routing.and_then(|routing| routing.reason.clone()),
+            selected_context_path: routing
+                .and_then(|routing| routing.selected_context_path.clone()),
             request_sha256: request_hash,
             response_sha256: response_hash,
         };
@@ -286,7 +341,8 @@ async fn run_one(
     let started = Instant::now();
     let (context_ref, routing) = match resolve_context_reference(test, context_index) {
         Ok(resolved) => resolved,
-        Err((error, routing)) => {
+        Err(error) => {
+            let (error, routing) = *error;
             return BenchmarkResult {
                 schema_version: SCHEMA_VERSION,
                 suite: suite_name(test),
@@ -743,19 +799,22 @@ fn error_result<E: std::fmt::Display>(input: ErrorResultInput<'_, E>) -> Benchma
     }
 }
 
+type ContextResolution = (String, Option<RoutingDecision>);
+type ContextResolutionError = Box<(String, Option<RoutingDecision>)>;
+
 fn resolve_context_reference(
     test: &TestCase,
     context_index: Option<&ContextIndex>,
-) -> std::result::Result<(String, Option<RoutingDecision>), (String, Option<RoutingDecision>)> {
+) -> std::result::Result<ContextResolution, ContextResolutionError> {
     if !is_auto_context(&test.context) {
         return Ok((test.context.clone(), None));
     }
 
     let Some(index) = context_index else {
-        return Err((
+        return Err(Box::new((
             "context routing requested but context index is unavailable".to_string(),
             None,
-        ));
+        )));
     };
 
     let decision = route_context(test, index);
@@ -770,7 +829,7 @@ fn resolve_context_reference(
                 .as_deref()
                 .unwrap_or("no context candidate selected")
         );
-        Err((message, Some(decision)))
+        Err(Box::new((message, Some(decision))))
     }
 }
 
@@ -808,7 +867,7 @@ pub(crate) fn read_tests(bench_dir: &Path) -> Result<Vec<TestCase>> {
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
             continue;
         }
-        if path.file_name().and_then(|name| name.to_str()) == Some("results.json") {
+        if is_generated_json_artifact(path) {
             continue;
         }
         paths.push(path.to_path_buf());
@@ -828,6 +887,13 @@ pub(crate) fn read_tests(bench_dir: &Path) -> Result<Vec<TestCase>> {
         }
     }
     Ok(tests)
+}
+
+fn is_generated_json_artifact(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("context.index.json" | "results.json" | "run.json")
+    )
 }
 
 fn load_context(bench_dir: &Path, context: &str) -> Result<String> {
@@ -997,6 +1063,12 @@ struct HttpExchangeLog {
     #[serde(skip_serializing_if = "Option::is_none")]
     error_kind: Option<ErrorKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    routing_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    routing_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_context_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     request_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_sha256: Option<String>,
@@ -1127,6 +1199,40 @@ request_style = "responses"
             tests[0].metadata.get("token_count"),
             Some(&"100000".to_string())
         );
+    }
+
+    #[test]
+    fn read_tests_ignores_generated_root_json_artifacts_in_flat_layout() {
+        let tmp = tempdir().unwrap();
+        fs::write(
+            tmp.path().join("needle.json"),
+            r#"
+{
+  "schema_version": 1,
+  "id": "flat-needle",
+  "context": "contexts/needle_context.txt",
+  "question": "q",
+  "expected": ["a"],
+  "grader": "Exact",
+  "metadata": {"suite": "needle", "token_count": "100000"}
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("context.index.json"),
+            r#"{"schema_version":1,"bench_id":"bench","created_at_unix_ms":1,"contexts":[]}"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("run.json"),
+            r#"{"schema_version":1,"bench_dir":"bench","results_path":"results.jsonl","started_at_unix_ms":1,"test_count":1,"provider_model":"m","provider_base_url":"u","provider_request_style":"chat-completions","request_timeout_secs":120,"max_retries":2,"retry_backoff_ms":500,"concurrency":1,"suites":["needle"]}"#,
+        )
+        .unwrap();
+
+        let tests = read_tests(tmp.path()).unwrap();
+        assert_eq!(tests.len(), 1);
+        assert_eq!(tests[0].id, "flat-needle");
     }
 
     #[test]
@@ -1273,6 +1379,76 @@ request_style = "responses"
         assert!(log.contains("response_sha256"));
         assert!(!log.contains("archive access code"));
         assert!(!log.contains("orchid-123"));
+    }
+
+    #[test]
+    fn request_logs_do_not_hash_unsent_context_route_failures() {
+        let tmp = tempdir().unwrap();
+        let test = TestCase {
+            schema_version: SCHEMA_VERSION,
+            id: "auto-1".to_string(),
+            context: "auto".to_string(),
+            question: "What is the code?".to_string(),
+            expected: vec!["a".to_string()],
+            grader: crate::benchmark::Grader::Exact,
+            metadata: BTreeMap::new(),
+        };
+        let result = BenchmarkResult {
+            schema_version: SCHEMA_VERSION,
+            suite: Some("needle".to_string()),
+            token_count: Some(100),
+            id: "auto-1".to_string(),
+            provider_model: Some("example-model".to_string()),
+            provider_base_url: Some("https://api.example.test/v1".to_string()),
+            http_status: None,
+            request_id: None,
+            rate_limit_remaining: None,
+            rate_limit_reset: None,
+            passed: false,
+            attempts: 0,
+            latency_ms: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            answer: None,
+            error: Some("context routing failed".to_string()),
+            error_kind: Some(ErrorKind::ContextRoute),
+            routing: Some(RoutingDecision {
+                schema_version: SCHEMA_VERSION,
+                test_id: "auto-1".to_string(),
+                selected_context_id: None,
+                selected_context_path: None,
+                method: "none".to_string(),
+                status: "ambiguous".to_string(),
+                confidence: 0.0,
+                candidates: vec![],
+                llm_router_used: false,
+                input_tokens: 0,
+                output_tokens: 0,
+                latency_ms: 0,
+                reason: Some("local_router_confidence_below_threshold".to_string()),
+            }),
+            judge_latency_ms: None,
+            judge_input_tokens: None,
+            metadata: BTreeMap::new(),
+        };
+        let log_path = tmp.path().join("reports/http-log.jsonl");
+
+        write_request_logs(tmp.path(), &log_path, &[test], &[result]).unwrap();
+        let log = fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("routing_status"));
+        assert!(log.contains("local_router_confidence_below_threshold"));
+        assert!(!log.contains("request_sha256"));
+    }
+
+    #[test]
+    fn run_output_guard_rejects_existing_results_without_force() {
+        let tmp = tempdir().unwrap();
+        let results = tmp.path().join("results.jsonl");
+        fs::write(&results, "old results").unwrap();
+
+        let error = ensure_output_paths_can_be_written(&results, None, false).unwrap_err();
+        assert!(error.to_string().contains("refusing to overwrite"));
+        ensure_output_paths_can_be_written(&results, None, true).unwrap();
     }
 
     #[test]
@@ -1426,5 +1602,77 @@ request_style = "responses"
 
         assert_eq!(result.answer, "ok");
         assert_eq!(result.attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn run_preflight_rejects_stale_context_index_before_provider_request() {
+        let tmp = tempdir().unwrap();
+        fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[provider]
+base_url = "http://127.0.0.1:9/v1"
+api_key_env = "LONGCTX_PREFLIGHT_KEY"
+model = "test-model"
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("contexts")).unwrap();
+        fs::create_dir_all(tmp.path().join("manifests")).unwrap();
+        fs::write(tmp.path().join("contexts/needle_context.txt"), "changed").unwrap();
+        fs::write(
+            tmp.path().join("manifests/needle.json"),
+            r#"
+{
+  "schema_version": 1,
+  "name": "needle",
+  "token_count": 100,
+  "seed": 7,
+  "suites": [{
+    "schema_version": 1,
+    "id": "needle-auto",
+    "context": "auto",
+    "question": "q",
+    "expected": ["a"],
+    "grader": "Exact",
+    "metadata": {"suite": "needle", "token_count": "100"}
+  }]
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("context.index.json"),
+            r#"{
+  "schema_version": 1,
+  "bench_id": "bench",
+  "created_at_unix_ms": 1,
+  "contexts": [{
+    "context_id": "needle_context",
+    "path": "contexts/needle_context.txt",
+    "sha256": "not-the-current-hash",
+    "suite": "needle",
+    "token_count": 100,
+    "seed": 7,
+    "source_manifests": ["manifests/needle.json"],
+    "test_ids": ["needle-auto"],
+    "title": "needle context",
+    "summary": "needle",
+    "keywords": ["needle"],
+    "safe_anchors": [],
+    "metadata": {}
+  }]
+}
+"#,
+        )
+        .unwrap();
+        std::env::set_var("LONGCTX_PREFLIGHT_KEY", "test-key");
+
+        let error =
+            run_benchmarks_with_options(tmp.path().to_str().unwrap(), RunOptions { force: false })
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("hash mismatch"));
+        assert!(!tmp.path().join("results.jsonl").exists());
     }
 }
