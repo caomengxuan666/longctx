@@ -186,8 +186,8 @@ Any provider that exposes an OpenAI-compatible `/chat/completions` endpoint can 
 
 Each generated suite writes:
 
-- A context text file under `contexts/`.
-- A suite manifest JSON file under `manifests/`.
+- Context text files under `contexts/`, with token-suffixed names so token sweeps do not overwrite earlier contexts.
+- Suite manifest JSON files under `manifests/`, with token-suffixed names so token sweeps can share one benchmark directory.
 - A context routing index at `context.index.json`.
 
 The runner accepts generated suite manifests and writes newline-delimited JSON results to `results.jsonl`.

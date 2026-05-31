@@ -1049,31 +1049,8 @@ pub(crate) fn read_config(path: &Path) -> Result<Config> {
 }
 
 pub(crate) fn read_tests(bench_dir: &Path) -> Result<Vec<TestCase>> {
-    let search_root = if bench_dir.join("manifests").is_dir() {
-        bench_dir.join("manifests")
-    } else {
-        bench_dir.to_path_buf()
-    };
-
-    let mut paths = Vec::new();
-    for entry in WalkDir::new(&search_root).min_depth(1) {
-        let entry = entry?;
-        let path = entry.path();
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
-        }
-        if is_generated_json_artifact(path) {
-            continue;
-        }
-        paths.push(path.to_path_buf());
-    }
-    paths.sort();
-
     let mut tests = Vec::new();
-    for path in paths {
+    for path in benchmark_json_paths(bench_dir)? {
         let text = fs::read_to_string(&path)
             .with_context(|| format!("failed to read test file {}", path.display()))?;
         if let Ok(manifest) = serde_json::from_str::<SuiteManifest>(&text) {
@@ -1097,6 +1074,36 @@ pub(crate) fn read_tests(bench_dir: &Path) -> Result<Vec<TestCase>> {
     Ok(tests)
 }
 
+fn benchmark_json_paths(bench_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    let manifests_dir = bench_dir.join("manifests");
+    if manifests_dir.is_dir() {
+        collect_json_files(&manifests_dir, usize::MAX, &mut paths)?;
+    }
+    collect_json_files(bench_dir, 1, &mut paths)?;
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn collect_json_files(root: &Path, max_depth: usize, paths: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in WalkDir::new(root).min_depth(1).max_depth(max_depth) {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        if is_generated_json_artifact(path) {
+            continue;
+        }
+        paths.push(path.to_path_buf());
+    }
+    Ok(())
+}
+
 fn enrich_test_from_manifest(
     mut test: TestCase,
     manifest_name: &str,
@@ -1118,7 +1125,14 @@ fn enrich_test_from_manifest(
 fn is_generated_json_artifact(path: &Path) -> bool {
     matches!(
         path.file_name().and_then(|name| name.to_str()),
-        Some("context.index.json" | "results.json" | "run.json")
+        Some(
+            "context.index.json"
+                | "results.json"
+                | "run.json"
+                | "report.json"
+                | "compare.json"
+                | "comparison.json"
+        )
     )
 }
 
@@ -1449,6 +1463,78 @@ request_style = "responses"
             tests[0].metadata.get("token_count"),
             Some(&"100000".to_string())
         );
+    }
+
+    #[test]
+    fn read_tests_keeps_flat_layout_when_manifests_dir_exists() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("manifests")).unwrap();
+        fs::write(
+            tmp.path().join("needle.json"),
+            r#"
+{
+  "schema_version": 1,
+  "id": "flat-needle",
+  "context": "contexts/needle_context.txt",
+  "question": "q",
+  "expected": ["a"],
+  "grader": "Exact",
+  "metadata": {"suite": "needle", "token_count": "100000"}
+}
+"#,
+        )
+        .unwrap();
+
+        let tests = read_tests(tmp.path()).unwrap();
+        assert_eq!(tests.len(), 1);
+        assert_eq!(tests[0].id, "flat-needle");
+    }
+
+    #[test]
+    fn read_tests_supports_mixed_flat_and_manifest_layouts() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("manifests")).unwrap();
+        fs::write(
+            tmp.path().join("flat.json"),
+            r#"
+{
+  "schema_version": 1,
+  "id": "flat-needle",
+  "context": "contexts/flat.txt",
+  "question": "q",
+  "expected": ["a"],
+  "grader": "Exact",
+  "metadata": {"suite": "needle", "token_count": "100"}
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("manifests/manifest.json"),
+            r#"
+{
+  "schema_version": 1,
+  "name": "needle",
+  "token_count": 200,
+  "seed": 7,
+  "suites": [{
+    "schema_version": 1,
+    "id": "manifest-needle",
+    "context": "contexts/manifest.txt",
+    "question": "q",
+    "expected": ["b"],
+    "grader": "Exact",
+    "metadata": {}
+  }]
+}
+"#,
+        )
+        .unwrap();
+
+        let tests = read_tests(tmp.path()).unwrap();
+        assert_eq!(tests.len(), 2);
+        assert!(tests.iter().any(|test| test.id == "flat-needle"));
+        assert!(tests.iter().any(|test| test.id == "manifest-needle"));
     }
 
     #[test]

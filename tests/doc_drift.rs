@@ -39,6 +39,7 @@ fn docs_cover_current_cli_and_config_surface() {
     assert!(readme.contains("--dry-run"));
     assert!(readme.contains("--filter"));
     assert!(readme.contains("benchmark directory"));
+    assert!(readme.contains("token-suffixed"));
     assert!(readme.contains("Minimum supported Rust version: 1.81"));
     assert!(readme.contains("cargo install longctx"));
     assert!(readme.contains("SHA256"));
@@ -51,6 +52,7 @@ fn docs_cover_current_cli_and_config_surface() {
     assert!(config.contains("run.request_log_path"));
     assert!(config.contains("reports/http-log.jsonl"));
     assert!(config.contains("context.index.json"));
+    assert!(config.contains("token count"));
     assert!(config.contains("Duplicate test IDs"));
     assert!(config.contains("LLM judge auditing"));
     assert!(config.contains("--limit"));

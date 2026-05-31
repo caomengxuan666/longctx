@@ -298,26 +298,9 @@ pub fn validate_context_index(bench_dir: &Path, index: &ContextIndex) -> Result<
 }
 
 fn read_manifests(bench_dir: &Path) -> Result<Vec<(PathBuf, SuiteManifest)>> {
-    let search_root = if bench_dir.join("manifests").is_dir() {
-        bench_dir.join("manifests")
-    } else {
-        bench_dir.to_path_buf()
-    };
-
     let mut manifests = Vec::new();
-    for entry in WalkDir::new(&search_root).min_depth(1) {
-        let entry = entry?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
-        }
-        if is_generated_json_artifact(path) {
-            continue;
-        }
-        let text = fs::read_to_string(path)
+    for path in benchmark_json_paths(bench_dir)? {
+        let text = fs::read_to_string(&path)
             .with_context(|| format!("failed to read manifest {}", path.display()))?;
         if let Ok(manifest) = serde_json::from_str::<SuiteManifest>(&text) {
             if manifest.schema_version > SCHEMA_VERSION {
@@ -332,7 +315,7 @@ fn read_manifests(bench_dir: &Path) -> Result<Vec<(PathBuf, SuiteManifest)>> {
         } else if let Ok(test) = serde_json::from_str::<TestCase>(&text) {
             manifests.push((
                 path.to_path_buf(),
-                suite_manifest_from_flat_test(path, test),
+                suite_manifest_from_flat_test(&path, test),
             ));
         } else {
             bail!("failed to parse manifest {}", path.display());
@@ -340,6 +323,36 @@ fn read_manifests(bench_dir: &Path) -> Result<Vec<(PathBuf, SuiteManifest)>> {
     }
     manifests.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(manifests)
+}
+
+fn benchmark_json_paths(bench_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    let manifests_dir = bench_dir.join("manifests");
+    if manifests_dir.is_dir() {
+        collect_json_files(&manifests_dir, usize::MAX, &mut paths)?;
+    }
+    collect_json_files(bench_dir, 1, &mut paths)?;
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn collect_json_files(root: &Path, max_depth: usize, paths: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in WalkDir::new(root).min_depth(1).max_depth(max_depth) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        if is_generated_json_artifact(path) {
+            continue;
+        }
+        paths.push(path.to_path_buf());
+    }
+    Ok(())
 }
 
 fn suite_manifest_from_flat_test(path: &Path, test: TestCase) -> SuiteManifest {
@@ -580,7 +593,14 @@ fn sha256_file(path: &Path) -> Result<String> {
 fn is_generated_json_artifact(path: &Path) -> bool {
     matches!(
         path.file_name().and_then(|name| name.to_str()),
-        Some("context.index.json" | "results.json" | "run.json")
+        Some(
+            "context.index.json"
+                | "results.json"
+                | "run.json"
+                | "report.json"
+                | "compare.json"
+                | "comparison.json"
+        )
     )
 }
 
@@ -915,5 +935,57 @@ mod tests {
         assert_eq!(index.contexts[0].path, "contexts/needle_context.txt");
         assert_eq!(index.contexts[0].token_count, 100);
         assert_eq!(index.contexts[0].seed, 7);
+    }
+
+    #[test]
+    fn build_context_index_supports_mixed_flat_and_manifest_layouts() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("contexts")).unwrap();
+        fs::create_dir_all(tmp.path().join("manifests")).unwrap();
+        fs::write(tmp.path().join("contexts/flat.txt"), "flat text").unwrap();
+        fs::write(tmp.path().join("contexts/manifest.txt"), "manifest text").unwrap();
+        fs::write(
+            tmp.path().join("flat.json"),
+            r#"{
+  "schema_version": 1,
+  "id": "flat-needle",
+  "context": "contexts/flat.txt",
+  "question": "What is the flat code?",
+  "expected": ["A"],
+  "grader": "Exact",
+  "metadata": {"suite": "needle", "token_count": "100"}
+}"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("manifests/manifest.json"),
+            r#"{
+  "schema_version": 1,
+  "name": "needle",
+  "token_count": 200,
+  "seed": 7,
+  "suites": [{
+    "schema_version": 1,
+    "id": "manifest-needle",
+    "context": "contexts/manifest.txt",
+    "question": "What is the manifest code?",
+    "expected": ["B"],
+    "grader": "Exact",
+    "metadata": {}
+  }]
+}"#,
+        )
+        .unwrap();
+
+        let index = build_context_index(tmp.path()).unwrap();
+        assert_eq!(index.contexts.len(), 2);
+        assert!(index
+            .contexts
+            .iter()
+            .any(|context| context.path == "contexts/flat.txt"));
+        assert!(index
+            .contexts
+            .iter()
+            .any(|context| context.path == "contexts/manifest.txt"));
     }
 }

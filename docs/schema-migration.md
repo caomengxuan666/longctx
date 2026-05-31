@@ -18,7 +18,7 @@ When a breaking change is unavoidable:
 
 Known compatible layouts:
 
-- Benchmark manifests under `manifests/*.json`.
+- Benchmark manifests under `manifests/*.json`, typically token-suffixed names such as `needle-100000.json`.
 - Older flat manifests at the benchmark root.
 - Result rows in `results.jsonl` with optional newer fields.
 - Nested routing audit objects in result rows, as long as their `schema_version` is supported.

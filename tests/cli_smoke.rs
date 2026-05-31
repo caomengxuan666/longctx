@@ -91,8 +91,8 @@ fn cli_generate_validate_index_and_dry_run() {
             .output()
             .unwrap(),
     );
-    assert!(bench.join("contexts/needle_context.txt").exists());
-    assert!(bench.join("manifests/needle.json").exists());
+    assert!(bench.join("contexts/needle_context-100.txt").exists());
+    assert!(bench.join("manifests/needle-100.json").exists());
     assert!(bench.join("context.index.json").exists());
 
     write_config(&bench, "LONGCTX_CLI_SMOKE_MISSING_KEY");
