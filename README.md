@@ -52,7 +52,7 @@ longctx run ./bench --filter needle --limit 2
 ```
 
 Results are written to `./bench/results.jsonl`.
-By default, `run` refuses to overwrite an existing `results.jsonl` or request log. Use `--force` when intentionally replacing prior output.
+By default, `run` refuses to overwrite an existing `results.jsonl`, `run.json`, or request log. Use `--force` when intentionally replacing prior output.
 Use `--dry-run` to validate config, select tests, and resolve `context = "auto"` without reading the API key, sending provider requests, or writing results. Use `--filter <text>` to select tests whose ID or suite contains the text, and `--limit <n>` to cap the selected set.
 
 ### `validate`
@@ -152,7 +152,7 @@ model = "gpt-4.1"
 
 Fields:
 
-- `base_url`: Provider base URL. The runner posts to `{base_url}/chat/completions`.
+- `base_url`: Provider base URL. It must be an absolute `http` or `https` URL with no query string or fragment. The runner posts to `{base_url}/chat/completions` or `{base_url}/responses`.
 - `api_key_env`: Name of the environment variable containing the API key.
 - `model`: Model name sent in the chat completion request.
 - `request_timeout_secs`: Per-request timeout in seconds.
@@ -186,6 +186,7 @@ The runner accepts generated suite manifests and writes newline-delimited JSON r
 Result rows include the suite name, token count, provider model, HTTP status, provider request ID, rate-limit headers, attempt count, structured error kind when a run fails, optional judge audit details, and optional routing audit details. Readers reject result rows with a newer unsupported `schema_version`, and `compare` rejects duplicate result IDs.
 Each run also writes a `run.json` snapshot with config and timing metadata.
 When `run.log_requests` is enabled, redacted HTTP exchange logs are written to `reports/http-log.jsonl`.
+Direct context file paths in manifests must resolve under the benchmark directory. Absolute paths and `..` paths that escape the benchmark directory are rejected before provider requests are sent.
 
 ## Automatic Context Routing
 

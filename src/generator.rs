@@ -13,6 +13,11 @@ pub fn generate(
     seed: Option<u64>,
     out_dir: &str,
 ) -> Result<()> {
+    let suite_type = normalize_suite_type(suite_type)?;
+    if token_count == 0 {
+        bail!("token count must be greater than 0");
+    }
+
     let out_dir = Path::new(out_dir);
     let manifests_dir = out_dir.join("manifests");
     let contexts_dir = out_dir.join("contexts");
@@ -29,31 +34,26 @@ pub fn generate(
         )
     })?;
 
-    let suite_type = suite_type.to_ascii_lowercase();
     let seed = seed.unwrap_or_else(|| rand::thread_rng().gen());
     let mut rng = StdRng::seed_from_u64(seed);
     let counter = TokenCounter::cl100k();
-    let manifest = match suite_type.as_str() {
-        "needle" | "needlesuite" => build_needle_suite(&mut rng, token_count, seed, &contexts_dir, &counter)?,
-        "multi-needle" | "multineedle" | "multi_needle" | "multineedlesuite" => {
+    let manifest = match suite_type {
+        "needle" => build_needle_suite(&mut rng, token_count, seed, &contexts_dir, &counter)?,
+        "multi-needle" => {
             build_multi_needle_suite(&mut rng, token_count, seed, &contexts_dir, &counter)?
         }
-        "conflict" | "conflictsuite" => {
-            build_conflict_suite(&mut rng, token_count, seed, &contexts_dir, &counter)?
-        }
-        "multi-hop" | "multihop" | "multi_hop" => {
-            build_multi_hop_suite(&mut rng, token_count, seed, &contexts_dir, &counter)?
-        }
-        "order-dependent" | "orderdependent" | "order_dependent" => {
+        "conflict" => build_conflict_suite(&mut rng, token_count, seed, &contexts_dir, &counter)?,
+        "multi-hop" => build_multi_hop_suite(&mut rng, token_count, seed, &contexts_dir, &counter)?,
+        "order-dependent" => {
             build_order_dependent_suite(&mut rng, token_count, seed, &contexts_dir, &counter)?
         }
-        "position-sweep" | "positionsweep" | "position_sweep" => {
+        "position-sweep" => {
             build_position_sweep_suite(&mut rng, token_count, seed, &contexts_dir, &counter)?
         }
-        "hallucination" | "hallucinationsuite" => {
+        "hallucination" => {
             build_hallucination_suite(&mut rng, token_count, seed, &contexts_dir, &counter)?
         }
-        other => bail!("unknown suite type '{other}', expected needle, multi-needle, conflict, multi-hop, order-dependent, position-sweep, or hallucination"),
+        _ => unreachable!("suite type is normalized before generation"),
     };
 
     let manifest_path = manifests_dir.join(format!("{}.json", manifest.name));
@@ -63,6 +63,21 @@ pub fn generate(
     let index = build_reproducible_context_index(out_dir)?;
     write_context_index(out_dir, &index)?;
     Ok(())
+}
+
+fn normalize_suite_type(suite_type: &str) -> Result<&'static str> {
+    match suite_type.to_ascii_lowercase().as_str() {
+        "needle" | "needlesuite" => Ok("needle"),
+        "multi-needle" | "multineedle" | "multi_needle" | "multineedlesuite" => {
+            Ok("multi-needle")
+        }
+        "conflict" | "conflictsuite" => Ok("conflict"),
+        "multi-hop" | "multihop" | "multi_hop" => Ok("multi-hop"),
+        "order-dependent" | "orderdependent" | "order_dependent" => Ok("order-dependent"),
+        "position-sweep" | "positionsweep" | "position_sweep" => Ok("position-sweep"),
+        "hallucination" | "hallucinationsuite" => Ok("hallucination"),
+        other => bail!("unknown suite type '{other}', expected needle, multi-needle, conflict, multi-hop, order-dependent, position-sweep, or hallucination"),
+    }
 }
 
 fn build_needle_suite(
@@ -620,8 +635,19 @@ mod tests {
     #[test]
     fn unknown_suite_type_returns_error() {
         let tmp = tempdir().unwrap();
-        let err = generate("nonexistent", 100, Some(1), tmp.path().to_str().unwrap()).unwrap_err();
+        let out = tmp.path().join("bench");
+        let err = generate("nonexistent", 100, Some(1), out.to_str().unwrap()).unwrap_err();
         assert!(err.to_string().contains("unknown suite type"));
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn zero_token_generation_returns_error_without_outputs() {
+        let tmp = tempdir().unwrap();
+        let out = tmp.path().join("bench");
+        let err = generate("needle", 0, Some(1), out.to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("token count"));
+        assert!(!out.exists());
     }
 
     #[test]

@@ -94,6 +94,12 @@ fn build_context_index_with_metadata(
     bench_id: String,
 ) -> Result<ContextIndex> {
     let manifests = read_manifests(bench_dir)?;
+    let bench_root = bench_dir.canonicalize().with_context(|| {
+        format!(
+            "failed to resolve benchmark directory {}",
+            bench_dir.display()
+        )
+    })?;
     let mut contexts: BTreeMap<String, ContextIndexEntry> = BTreeMap::new();
 
     for (manifest_path, manifest) in manifests {
@@ -104,11 +110,7 @@ fn build_context_index_with_metadata(
                 continue;
             }
 
-            let relative_context = normalize_relative_context_path(bench_dir, &test.context);
-            let absolute_context = bench_dir.join(&relative_context);
-            if !absolute_context.exists() {
-                continue;
-            }
+            let relative_context = resolve_index_context_path(&bench_root, &test.context)?;
 
             let suite = suite_for_index(&manifest_name, &test);
             let context_id = context_id_from_path(&relative_context);
@@ -158,6 +160,25 @@ fn build_context_index_with_metadata(
         created_at_unix_ms,
         contexts: entries,
     })
+}
+
+fn resolve_index_context_path(bench_root: &Path, context: &str) -> Result<String> {
+    let path = PathBuf::from(context);
+    let candidate = if path.is_absolute() {
+        path
+    } else {
+        bench_root.join(path)
+    };
+    let resolved = candidate
+        .canonicalize()
+        .with_context(|| format!("context does not resolve to a file: {}", context))?;
+    if !resolved.starts_with(bench_root) {
+        bail!(
+            "context file must stay under benchmark directory: {}",
+            context
+        );
+    }
+    Ok(relative_path(bench_root, &resolved))
 }
 
 fn bench_id_from_path(bench_dir: &Path) -> String {
@@ -299,12 +320,22 @@ fn read_manifests(bench_dir: &Path) -> Result<Vec<(PathBuf, SuiteManifest)>> {
         let text = fs::read_to_string(path)
             .with_context(|| format!("failed to read manifest {}", path.display()))?;
         if let Ok(manifest) = serde_json::from_str::<SuiteManifest>(&text) {
+            if manifest.schema_version > SCHEMA_VERSION {
+                bail!(
+                    "manifest {} schema_version {} is newer than supported schema_version {}",
+                    path.display(),
+                    manifest.schema_version,
+                    SCHEMA_VERSION
+                );
+            }
             manifests.push((path.to_path_buf(), manifest));
         } else if let Ok(test) = serde_json::from_str::<TestCase>(&text) {
             manifests.push((
                 path.to_path_buf(),
                 suite_manifest_from_flat_test(path, test),
             ));
+        } else {
+            bail!("failed to parse manifest {}", path.display());
         }
     }
     manifests.sort_by(|a, b| a.0.cmp(&b.0));
@@ -426,14 +457,6 @@ fn routing_method(candidate: &RoutingCandidate) -> String {
 
 fn looks_inline_context(context: &str) -> bool {
     context.contains('\n') || context.len() > 4096
-}
-
-fn normalize_relative_context_path(bench_dir: &Path, context: &str) -> String {
-    let path = PathBuf::from(context);
-    if path.is_absolute() {
-        return relative_path(bench_dir, &path);
-    }
-    path.to_string_lossy().replace('\\', "/")
 }
 
 fn relative_path(base: &Path, path: &Path) -> String {
@@ -610,6 +633,71 @@ mod tests {
         assert_eq!(index.contexts[0].suite, "needle");
         assert!(index.contexts[0].keywords.contains(&"archive".to_string()));
         validate_context_index(tmp.path(), &index).unwrap();
+    }
+
+    #[test]
+    fn build_context_index_rejects_newer_manifest_schema_version() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("contexts")).unwrap();
+        fs::create_dir_all(tmp.path().join("manifests")).unwrap();
+        fs::write(
+            tmp.path().join("contexts/needle_context.txt"),
+            "needle text",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("manifests/needle.json"),
+            r#"{
+  "schema_version": 999,
+  "name": "needle",
+  "token_count": 100,
+  "seed": 7,
+  "suites": [{
+    "schema_version": 1,
+    "id": "needle-100",
+    "context": "contexts/needle_context.txt",
+    "question": "What is the archive access code?",
+    "expected": ["ORCHID-1"],
+    "grader": "Exact",
+    "metadata": {}
+  }]
+}"#,
+        )
+        .unwrap();
+
+        let error = build_context_index(tmp.path()).unwrap_err();
+        assert!(error.to_string().contains("schema_version 999"));
+    }
+
+    #[test]
+    fn build_context_index_rejects_context_paths_outside_bench_dir() {
+        let tmp = tempdir().unwrap();
+        let bench = tmp.path().join("bench");
+        fs::create_dir_all(bench.join("manifests")).unwrap();
+        let outside = tmp.path().join("secret.txt");
+        fs::write(&outside, "do not index").unwrap();
+        fs::write(
+            bench.join("manifests/needle.json"),
+            r#"{
+  "schema_version": 1,
+  "name": "needle",
+  "token_count": 100,
+  "seed": 7,
+  "suites": [{
+    "schema_version": 1,
+    "id": "needle-100",
+    "context": "../secret.txt",
+    "question": "What is the archive access code?",
+    "expected": ["ORCHID-1"],
+    "grader": "Exact",
+    "metadata": {}
+  }]
+}"#,
+        )
+        .unwrap();
+
+        let error = build_context_index(&bench).unwrap_err();
+        assert!(error.to_string().contains("benchmark directory"));
     }
 
     #[test]

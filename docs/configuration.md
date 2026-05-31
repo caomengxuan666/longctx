@@ -19,7 +19,7 @@ concurrency = 4
 
 Fields:
 
-- `provider.base_url`: OpenAI-compatible API root.
+- `provider.base_url`: OpenAI-compatible API root. It must be an absolute `http` or `https` URL with no query string or fragment.
 - `provider.api_key_env`: Environment variable that stores the API key.
 - `provider.model`: Model name sent in each request.
 - `provider.request_style`: Request style, either `chat-completions` or `responses`.
@@ -32,7 +32,7 @@ Fields:
 
 Run output safety:
 
-- `longctx run` refuses to overwrite an existing `results.jsonl` or request log by default.
+- `longctx run` refuses to overwrite an existing `results.jsonl`, `run.json`, or request log by default.
 - Use `longctx run ./bench --force` when intentionally replacing prior output.
 - Use `longctx run ./bench --dry-run` to validate config, apply selection, and resolve auto routing without API credentials, provider requests, or output files.
 - Use `--filter <text>` to select tests by ID or suite substring and `--limit <n>` to cap the selected run set.
@@ -47,6 +47,12 @@ Generated benchmark layout:
 - `reports/http-log.jsonl`: Optional redacted request log output when enabled.
 - `run.json`: Run snapshot with timing and config metadata.
 - `report.html` or `reports/*.html`: Human-readable report output.
+
+Context file safety:
+
+- Direct `context` file paths must resolve under the benchmark directory.
+- Absolute paths and `..` paths that escape the benchmark directory are rejected before provider requests are sent.
+- Inline context remains supported for values that clearly contain content instead of a path, such as multi-line text.
 
 Automatic context routing:
 

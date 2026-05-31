@@ -33,9 +33,11 @@ fn docs_cover_current_cli_and_config_surface() {
     assert!(readme.contains("--force"));
     assert!(readme.contains("--dry-run"));
     assert!(readme.contains("--filter"));
+    assert!(readme.contains("benchmark directory"));
 
     let config = fs::read_to_string("docs/configuration.md")
         .expect("docs/configuration.md should be readable");
+    assert!(config.contains("provider.base_url"));
     assert!(config.contains("provider.request_style"));
     assert!(config.contains("run.log_requests"));
     assert!(config.contains("run.request_log_path"));
@@ -44,6 +46,7 @@ fn docs_cover_current_cli_and_config_surface() {
     assert!(config.contains("Duplicate test IDs"));
     assert!(config.contains("LLM judge auditing"));
     assert!(config.contains("--limit"));
+    assert!(config.contains("Context file safety"));
 
     let roadmap = fs::read_to_string("docs/productionization.md")
         .expect("docs/productionization.md should be readable");

@@ -8,7 +8,7 @@ use crate::context_index::{
 };
 use crate::grader::{grade, grade_with_llm};
 use crate::tokenizer::TokenCounter;
-use crate::validator::validate_loaded_benchmark_with_options;
+use crate::validator::{resolve_context_path, validate_loaded_benchmark_with_options};
 use anyhow::{anyhow, Context, Result};
 use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
@@ -72,7 +72,12 @@ pub async fn run_benchmarks_with_options(bench_dir: &str, options: RunOptions) -
         .run
         .log_requests
         .then(|| bench_path.join(&config.run.request_log_path));
-    ensure_output_paths_can_be_written(&results_path, request_log_path.as_deref(), options.force)?;
+    ensure_output_paths_can_be_written(
+        &results_path,
+        &metadata_path,
+        request_log_path.as_deref(),
+        options.force,
+    )?;
 
     let run_started = Instant::now();
     let started_at_unix_ms = unix_ms_now();
@@ -260,6 +265,7 @@ fn validate_auto_routing(
 
 fn ensure_output_paths_can_be_written(
     results_path: &Path,
+    metadata_path: &Path,
     request_log_path: Option<&Path>,
     force: bool,
 ) -> Result<()> {
@@ -268,6 +274,9 @@ fn ensure_output_paths_can_be_written(
     }
     if results_path.exists() {
         bail_existing_output(results_path)?;
+    }
+    if metadata_path.exists() {
+        bail_existing_output(metadata_path)?;
     }
     if let Some(path) = request_log_path {
         if path.exists() {
@@ -1061,7 +1070,17 @@ pub(crate) fn read_tests(bench_dir: &Path) -> Result<Vec<TestCase>> {
         let text = fs::read_to_string(&path)
             .with_context(|| format!("failed to read test file {}", path.display()))?;
         if let Ok(manifest) = serde_json::from_str::<SuiteManifest>(&text) {
-            tests.extend(manifest.suites);
+            if manifest.schema_version > SCHEMA_VERSION {
+                anyhow::bail!(
+                    "manifest {} schema_version {} is newer than supported schema_version {}",
+                    path.display(),
+                    manifest.schema_version,
+                    SCHEMA_VERSION
+                );
+            }
+            tests.extend(manifest.suites.into_iter().map(|test| {
+                enrich_test_from_manifest(test, &manifest.name, manifest.token_count, manifest.seed)
+            }));
         } else {
             let test = serde_json::from_str::<TestCase>(&text)
                 .with_context(|| format!("failed to parse {}", path.display()))?;
@@ -1069,6 +1088,24 @@ pub(crate) fn read_tests(bench_dir: &Path) -> Result<Vec<TestCase>> {
         }
     }
     Ok(tests)
+}
+
+fn enrich_test_from_manifest(
+    mut test: TestCase,
+    manifest_name: &str,
+    token_count: u64,
+    seed: u64,
+) -> TestCase {
+    test.metadata
+        .entry("suite".to_string())
+        .or_insert_with(|| manifest_name.to_string());
+    test.metadata
+        .entry("token_count".to_string())
+        .or_insert_with(|| token_count.to_string());
+    test.metadata
+        .entry("seed".to_string())
+        .or_insert_with(|| seed.to_string());
+    test
 }
 
 fn is_generated_json_artifact(path: &Path) -> bool {
@@ -1079,24 +1116,11 @@ fn is_generated_json_artifact(path: &Path) -> bool {
 }
 
 fn load_context(bench_dir: &Path, context: &str) -> Result<String> {
-    let context_path = PathBuf::from(context);
-    if context_path.is_absolute() && context_path.exists() {
-        return fs::read_to_string(&context_path)
-            .with_context(|| format!("failed to read context {}", context_path.display()));
+    match resolve_context_path(bench_dir, context)? {
+        Some(path) => fs::read_to_string(&path)
+            .with_context(|| format!("failed to read context {}", path.display())),
+        None => Ok(context.to_string()),
     }
-
-    let relative = bench_dir.join(&context_path);
-    if relative.exists() {
-        return fs::read_to_string(&relative)
-            .with_context(|| format!("failed to read context {}", relative.display()));
-    }
-
-    if context_path.exists() {
-        return fs::read_to_string(&context_path)
-            .with_context(|| format!("failed to read context {}", context_path.display()));
-    }
-
-    Ok(context.to_string())
 }
 
 #[derive(Debug, Serialize)]
@@ -1353,6 +1377,43 @@ request_style = "responses"
         let tests = read_tests(tmp.path()).unwrap();
         assert_eq!(tests.len(), 1);
         assert_eq!(tests[0].id, "needle-100");
+        assert_eq!(tests[0].metadata.get("suite"), Some(&"needle".to_string()));
+        assert_eq!(
+            tests[0].metadata.get("token_count"),
+            Some(&"100".to_string())
+        );
+        assert_eq!(tests[0].metadata.get("seed"), Some(&"7".to_string()));
+    }
+
+    #[test]
+    fn read_tests_rejects_newer_manifest_schema_version() {
+        let tmp = tempdir().unwrap();
+        let manifests = tmp.path().join("manifests");
+        fs::create_dir_all(&manifests).unwrap();
+        fs::write(
+            manifests.join("needle.json"),
+            r#"
+{
+  "schema_version": 999,
+  "name": "needle",
+  "token_count": 100,
+  "seed": 7,
+  "suites": [{
+    "schema_version": 1,
+    "id": "needle-100",
+    "context": "contexts/needle_context.txt",
+    "question": "q",
+    "expected": ["a"],
+    "grader": "Exact",
+    "metadata": {}
+  }]
+}
+"#,
+        )
+        .unwrap();
+
+        let error = read_tests(tmp.path()).unwrap_err();
+        assert!(error.to_string().contains("schema_version 999"));
     }
 
     #[test]
@@ -1634,11 +1695,26 @@ request_style = "responses"
     fn run_output_guard_rejects_existing_results_without_force() {
         let tmp = tempdir().unwrap();
         let results = tmp.path().join("results.jsonl");
+        let metadata = tmp.path().join("run.json");
         fs::write(&results, "old results").unwrap();
 
-        let error = ensure_output_paths_can_be_written(&results, None, false).unwrap_err();
+        let error =
+            ensure_output_paths_can_be_written(&results, &metadata, None, false).unwrap_err();
         assert!(error.to_string().contains("refusing to overwrite"));
-        ensure_output_paths_can_be_written(&results, None, true).unwrap();
+        ensure_output_paths_can_be_written(&results, &metadata, None, true).unwrap();
+    }
+
+    #[test]
+    fn run_output_guard_rejects_existing_run_metadata_without_force() {
+        let tmp = tempdir().unwrap();
+        let results = tmp.path().join("results.jsonl");
+        let metadata = tmp.path().join("run.json");
+        fs::write(&metadata, "{}").unwrap();
+
+        let error =
+            ensure_output_paths_can_be_written(&results, &metadata, None, false).unwrap_err();
+        assert!(error.to_string().contains("run.json"));
+        ensure_output_paths_can_be_written(&results, &metadata, None, true).unwrap();
     }
 
     #[test]
@@ -1824,8 +1900,20 @@ model = "example-model"
     #[test]
     fn load_context_returns_inline_for_missing_file() {
         let tmp = tempdir().unwrap();
-        let content = load_context(tmp.path(), "some inline text").unwrap();
-        assert_eq!(content, "some inline text");
+        let content = load_context(tmp.path(), "some inline text\nwith newline").unwrap();
+        assert_eq!(content, "some inline text\nwith newline");
+    }
+
+    #[test]
+    fn load_context_rejects_files_outside_bench_dir() {
+        let tmp = tempdir().unwrap();
+        let bench = tmp.path().join("bench");
+        fs::create_dir_all(&bench).unwrap();
+        let outside = tmp.path().join("secret.txt");
+        fs::write(&outside, "do not send").unwrap();
+
+        let error = load_context(&bench, "../secret.txt").unwrap_err();
+        assert!(error.to_string().contains("benchmark directory"));
     }
 
     #[test]

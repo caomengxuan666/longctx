@@ -165,6 +165,28 @@ fn cli_run_refuses_existing_results_without_force() {
 }
 
 #[test]
+fn cli_generate_invalid_suite_has_no_filesystem_side_effects() {
+    let tmp = tempdir().unwrap();
+    let bench = tmp.path().join("bench");
+
+    let output = assert_failure(
+        longctx()
+            .args([
+                "generate",
+                "not-a-suite",
+                "--tokens",
+                "100",
+                "--out",
+                bench.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert!(output.contains("unknown suite type"));
+    assert!(!bench.exists());
+}
+
+#[test]
 fn cli_report_and_compare_outputs() {
     let tmp = tempdir().unwrap();
     let baseline = tmp.path().join("baseline.jsonl");
