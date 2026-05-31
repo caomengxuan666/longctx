@@ -1,6 +1,7 @@
 use crate::benchmark::{Grader, TestCase};
 use crate::tokenizer::TokenCounter;
 use regex::Regex;
+use std::time::{Duration, Instant};
 
 pub fn grade(answer: &str, test: &TestCase) -> bool {
     let answer = answer.trim();
@@ -147,6 +148,8 @@ pub async fn grade_with_llm(
     api_key: &str,
     model: &str,
     timeout_secs: u64,
+    max_retries: u32,
+    retry_backoff_ms: u64,
     counter: &TokenCounter,
 ) -> LlmJudgeResult {
     let expected = test.expected.join(", ");
@@ -161,7 +164,7 @@ pub async fn grade_with_llm(
     );
 
     let input_tokens = counter.count_tokens(&prompt);
-    let started = std::time::Instant::now();
+    let started = Instant::now();
 
     let body = serde_json::json!({
         "model": model,
@@ -170,43 +173,60 @@ pub async fn grade_with_llm(
     });
 
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-    let resp = match client
-        .post(&url)
-        .bearer_auth(api_key)
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(timeout_secs))
-        .send()
-        .await
-    {
-        Ok(resp) => resp,
-        Err(error) => {
-            return LlmJudgeResult {
-                passed: false,
-                latency_ms: started.elapsed().as_millis() as u64,
-                input_tokens,
-                output_tokens: 0,
-                http_status: None,
-                attempts: 1,
-                error: Some(error.to_string()),
-            };
+    let max_attempts = max_retries.saturating_add(1).max(1);
+    let mut attempts = 0;
+
+    let resp = loop {
+        attempts += 1;
+        match client
+            .post(&url)
+            .bearer_auth(api_key)
+            .json(&body)
+            .timeout(Duration::from_secs(timeout_secs))
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    if is_retryable_status(status) && attempts < max_attempts {
+                        tokio::time::sleep(retry_delay(retry_backoff_ms, attempts)).await;
+                        continue;
+                    }
+                    return LlmJudgeResult {
+                        passed: false,
+                        latency_ms: started.elapsed().as_millis() as u64,
+                        input_tokens,
+                        output_tokens: 0,
+                        http_status: Some(status.as_u16()),
+                        attempts,
+                        error: Some(format!("HTTP {status} from judge: {}", body.trim())),
+                    };
+                }
+                break resp;
+            }
+            Err(error) => {
+                if is_retryable_error(&error) && attempts < max_attempts {
+                    tokio::time::sleep(retry_delay(retry_backoff_ms, attempts)).await;
+                    continue;
+                }
+                return LlmJudgeResult {
+                    passed: false,
+                    latency_ms: started.elapsed().as_millis() as u64,
+                    input_tokens,
+                    output_tokens: 0,
+                    http_status: None,
+                    attempts,
+                    error: Some(error.to_string()),
+                };
+            }
         }
     };
 
     let latency_ms = started.elapsed().as_millis() as u64;
     let status = resp.status();
     let http_status = Some(status.as_u16());
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return LlmJudgeResult {
-            passed: false,
-            latency_ms,
-            input_tokens,
-            output_tokens: 0,
-            http_status,
-            attempts: 1,
-            error: Some(format!("HTTP {status} from judge: {}", body.trim())),
-        };
-    }
 
     let Ok(json) = resp.json::<serde_json::Value>().await else {
         return LlmJudgeResult {
@@ -215,7 +235,7 @@ pub async fn grade_with_llm(
             input_tokens,
             output_tokens: 0,
             http_status,
-            attempts: 1,
+            attempts,
             error: Some("failed to decode judge response JSON".to_string()),
         };
     };
@@ -242,9 +262,30 @@ pub async fn grade_with_llm(
         input_tokens,
         output_tokens,
         http_status,
-        attempts: 1,
+        attempts,
         error: None,
     }
+}
+
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::REQUEST_TIMEOUT
+            | reqwest::StatusCode::TOO_MANY_REQUESTS
+            | reqwest::StatusCode::INTERNAL_SERVER_ERROR
+            | reqwest::StatusCode::BAD_GATEWAY
+            | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            | reqwest::StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+fn is_retryable_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect() || error.is_request()
+}
+
+fn retry_delay(retry_backoff_ms: u64, attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(10);
+    Duration::from_millis(retry_backoff_ms.saturating_mul(1u64 << shift))
 }
 
 #[cfg(test)]

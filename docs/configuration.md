@@ -71,4 +71,5 @@ LLM judge auditing:
 
 - Test cases with `grader = "LlmJudge"` use the configured provider chat-completions endpoint as a judge.
 - Judge API failures are distinct from ordinary answer mismatches and set `error_kind` to `Judge`.
+- Judge requests use the same `run.max_retries`, `run.retry_backoff_ms`, and `run.request_timeout_secs` controls as benchmark provider requests.
 - Result rows include judge HTTP status, attempts, latency, token counts, and error text when judge metadata is available.

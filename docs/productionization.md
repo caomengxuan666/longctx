@@ -40,6 +40,7 @@ The next work should make the loop dependable enough for repeat use.
 - Runtime context index validation for stale hashes and path escape attempts.
 - Result reader guards for unsupported future schema versions and duplicate comparison IDs.
 - Structured LLM judge failure reporting with judge status, attempts, token, latency, and error metadata.
+- LLM judge retry/backoff behavior aligned with benchmark provider requests.
 - Dry-run, filter, and limit controls for targeted benchmark execution.
 - Durable result writes that flush each completed row during long runs.
 - Token-suffixed generated manifests and contexts so token sweeps do not overwrite earlier suites.

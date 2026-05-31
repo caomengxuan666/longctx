@@ -662,6 +662,8 @@ async fn run_one(
                     api_key,
                     judge_model,
                     run.request_timeout_secs,
+                    run.max_retries,
+                    run.retry_backoff_ms,
                     counter,
                 )
                 .await;
@@ -2364,13 +2366,107 @@ model = "test-model"
         let result: BenchmarkResult = serde_json::from_str(&result_line).unwrap();
         assert_eq!(result.error_kind, Some(ErrorKind::Judge));
         assert_eq!(result.judge_http_status, Some(500));
-        assert_eq!(result.judge_attempts, Some(1));
+        assert_eq!(result.judge_attempts, Some(3));
         assert!(result
             .judge_error
             .as_deref()
             .unwrap_or_default()
             .contains("judge unavailable"));
         assert!(result.error.unwrap().contains("LLM judge failed"));
+    }
+
+    #[tokio::test]
+    async fn run_retries_llm_judge_failures_then_passes() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("Use the context to answer"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "candidate answer"}}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 2}
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("You are grading an answer"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("judge unavailable"))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("You are grading an answer"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "CORRECT"}}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 1}
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("contexts")).unwrap();
+        fs::create_dir_all(tmp.path().join("manifests")).unwrap();
+        fs::write(tmp.path().join("contexts/test.txt"), "context").unwrap();
+        fs::write(
+            tmp.path().join("config.toml"),
+            format!(
+                r#"
+[provider]
+base_url = "{}"
+api_key_env = "LONGCTX_JUDGE_RETRY_TEST_KEY"
+model = "test-model"
+
+[run]
+max_retries = 2
+retry_backoff_ms = 1
+"#,
+                mock_server.uri()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("manifests/judge.json"),
+            r#"
+{
+  "schema_version": 1,
+  "name": "judge",
+  "token_count": 100,
+  "seed": 7,
+  "suites": [{
+    "schema_version": 1,
+    "id": "judge-1",
+    "context": "contexts/test.txt",
+    "question": "q",
+    "expected": ["candidate answer"],
+    "grader": "LlmJudge",
+    "metadata": {"suite": "judge", "token_count": "100"}
+  }]
+}
+"#,
+        )
+        .unwrap();
+        std::env::set_var("LONGCTX_JUDGE_RETRY_TEST_KEY", "test-key");
+
+        run_benchmarks_with_options(
+            tmp.path().to_str().unwrap(),
+            RunOptions {
+                force: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let result_line = fs::read_to_string(tmp.path().join("results.jsonl")).unwrap();
+        let result: BenchmarkResult = serde_json::from_str(&result_line).unwrap();
+        assert!(result.passed);
+        assert_eq!(result.judge_attempts, Some(2));
+        assert_eq!(result.judge_http_status, Some(200));
+        assert_eq!(result.judge_error, None);
     }
 
     #[tokio::test]
