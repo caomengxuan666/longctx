@@ -40,6 +40,7 @@ fn docs_cover_current_cli_and_config_surface() {
     assert!(readme.contains("--filter"));
     assert!(readme.contains("benchmark directory"));
     assert!(readme.contains("token-suffixed"));
+    assert!(readme.contains("SHA256 fingerprints"));
     assert!(readme.contains("Minimum supported Rust version: 1.81"));
     assert!(readme.contains("cargo install longctx"));
     assert!(readme.contains("SHA256"));
@@ -58,6 +59,7 @@ fn docs_cover_current_cli_and_config_surface() {
     assert!(config.contains("--limit"));
     assert!(config.contains("Context file safety"));
     assert!(config.contains("Result durability"));
+    assert!(config.contains("SHA256 fingerprints"));
 
     let roadmap = fs::read_to_string("docs/productionization.md")
         .expect("docs/productionization.md should be readable");
@@ -66,4 +68,5 @@ fn docs_cover_current_cli_and_config_surface() {
     assert!(roadmap.contains("license"));
     assert!(roadmap.contains("MSRV 1.81"));
     assert!(roadmap.contains("Durable result writes"));
+    assert!(roadmap.contains("artifact fingerprints"));
 }

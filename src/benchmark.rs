@@ -163,6 +163,15 @@ pub struct RunMetadata {
     pub request_log_path: Option<String>,
     #[serde(default)]
     pub suites: Vec<String>,
+    #[serde(default)]
+    pub artifact_fingerprints: Vec<ArtifactFingerprint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactFingerprint {
+    pub path: String,
+    pub sha256: String,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -393,5 +402,25 @@ mod tests {
     fn grader_config_default_has_no_judge_model() {
         let config = GraderConfig::default();
         assert!(config.judge_model.is_none());
+    }
+
+    #[test]
+    fn older_run_metadata_defaults_artifact_fingerprints() {
+        let json = r#"{
+            "schema_version": 1,
+            "bench_dir": "bench",
+            "results_path": "bench/results.jsonl",
+            "started_at_unix_ms": 1,
+            "test_count": 1,
+            "provider_model": "model",
+            "provider_base_url": "https://api.example.test/v1",
+            "provider_request_style": "chat-completions",
+            "request_timeout_secs": 120,
+            "max_retries": 2,
+            "retry_backoff_ms": 500,
+            "concurrency": 1
+        }"#;
+        let metadata: RunMetadata = serde_json::from_str(json).unwrap();
+        assert!(metadata.artifact_fingerprints.is_empty());
     }
 }

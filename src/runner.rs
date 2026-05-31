@@ -1,6 +1,6 @@
 use crate::benchmark::{
-    BenchmarkResult, Config, ErrorKind, GraderConfig, ProviderConfig, RoutingDecision, RunConfig,
-    RunMetadata, SuiteManifest, TestCase, SCHEMA_VERSION,
+    ArtifactFingerprint, BenchmarkResult, Config, ErrorKind, GraderConfig, ProviderConfig,
+    RoutingDecision, RunConfig, RunMetadata, SuiteManifest, TestCase, SCHEMA_VERSION,
 };
 use crate::context_index::{
     is_auto_context, load_or_build_context_index, load_or_build_context_index_in_memory,
@@ -87,7 +87,7 @@ pub async fn run_benchmarks_with_options(bench_dir: &str, options: RunOptions) -
         started_at_unix_ms,
         &config,
         &tests,
-    );
+    )?;
     write_run_metadata(&metadata_path, &metadata)?;
 
     let mut results_file = OpenOptions::new()
@@ -297,8 +297,8 @@ fn build_run_metadata(
     started_at_unix_ms: u64,
     config: &Config,
     tests: &[TestCase],
-) -> RunMetadata {
-    RunMetadata {
+) -> Result<RunMetadata> {
+    Ok(RunMetadata {
         schema_version: SCHEMA_VERSION,
         bench_dir: bench_path.to_string_lossy().into_owned(),
         results_path: results_path.to_string_lossy().into_owned(),
@@ -320,12 +320,57 @@ fn build_run_metadata(
             None
         },
         suites: suite_names(tests),
-    }
+        artifact_fingerprints: artifact_fingerprints(bench_path)?,
+    })
 }
 
 fn write_run_metadata(path: &Path, metadata: &RunMetadata) -> Result<()> {
     let json = serde_json::to_string_pretty(metadata)?;
     fs::write(path, json).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn artifact_fingerprints(bench_path: &Path) -> Result<Vec<ArtifactFingerprint>> {
+    let mut paths = Vec::new();
+    collect_artifact_files(&bench_path.join("manifests"), &mut paths)?;
+    collect_artifact_files(&bench_path.join("contexts"), &mut paths)?;
+    let index_path = bench_path.join(crate::context_index::CONTEXT_INDEX_FILE);
+    if index_path.is_file() {
+        paths.push(index_path);
+    }
+    paths.sort();
+    paths.dedup();
+
+    let mut fingerprints = Vec::with_capacity(paths.len());
+    for path in paths {
+        let metadata =
+            fs::metadata(&path).with_context(|| format!("failed to stat {}", path.display()))?;
+        fingerprints.push(ArtifactFingerprint {
+            path: relative_path(bench_path, &path),
+            sha256: sha256_file(&path)?,
+            bytes: metadata.len(),
+        });
+    }
+    Ok(fingerprints)
+}
+
+fn collect_artifact_files(root: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+    for entry in WalkDir::new(root).min_depth(1) {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            paths.push(entry.path().to_path_buf());
+        }
+    }
+    Ok(())
+}
+
+fn relative_path(base: &Path, path: &Path) -> String {
+    path.strip_prefix(base)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 fn write_request_logs(
@@ -1313,6 +1358,13 @@ fn sha256_hex(text: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn sha256_file(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1605,7 +1657,18 @@ request_style = "responses"
             metadata,
         }];
 
-        let snapshot = build_run_metadata(bench_dir.path(), &results_path, 1234, &config, &tests);
+        fs::create_dir_all(bench_dir.path().join("contexts")).unwrap();
+        fs::create_dir_all(bench_dir.path().join("manifests")).unwrap();
+        fs::write(
+            bench_dir.path().join("contexts/needle_context.txt"),
+            "context",
+        )
+        .unwrap();
+        fs::write(bench_dir.path().join("manifests/needle.json"), "{}").unwrap();
+        fs::write(bench_dir.path().join("context.index.json"), "{}").unwrap();
+
+        let snapshot =
+            build_run_metadata(bench_dir.path(), &results_path, 1234, &config, &tests).unwrap();
         assert_eq!(snapshot.schema_version, SCHEMA_VERSION);
         assert_eq!(snapshot.test_count, 1);
         assert_eq!(snapshot.provider_model, "example-model");
@@ -1618,6 +1681,15 @@ request_style = "responses"
         );
         assert_eq!(snapshot.suites, vec!["needle"]);
         assert_eq!(snapshot.finished_at_unix_ms, None);
+        assert_eq!(snapshot.artifact_fingerprints.len(), 3);
+        assert!(snapshot
+            .artifact_fingerprints
+            .iter()
+            .any(|artifact| artifact.path == "contexts/needle_context.txt"));
+        assert!(snapshot
+            .artifact_fingerprints
+            .iter()
+            .all(|artifact| !artifact.sha256.is_empty() && artifact.bytes > 0));
     }
 
     #[test]

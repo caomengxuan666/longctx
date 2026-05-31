@@ -192,7 +192,7 @@ Each generated suite writes:
 
 The runner accepts generated suite manifests and writes newline-delimited JSON results to `results.jsonl`.
 Result rows include the suite name, token count, provider model, HTTP status, provider request ID, rate-limit headers, attempt count, structured error kind when a run fails, optional judge audit details, and optional routing audit details. Readers reject result rows with a newer unsupported `schema_version`, and `compare` rejects duplicate result IDs.
-Each run also writes a `run.json` snapshot with config and timing metadata.
+Each run also writes a `run.json` snapshot with config, timing metadata, and SHA256 fingerprints for benchmark manifests, contexts, and `context.index.json`.
 When `run.log_requests` is enabled, redacted HTTP exchange logs are written to `reports/http-log.jsonl`.
 Direct context file paths in manifests must resolve under the benchmark directory. Absolute paths and `..` paths that escape the benchmark directory are rejected before provider requests are sent.
 
