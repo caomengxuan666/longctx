@@ -200,6 +200,15 @@ fn cli_probe_context_help_is_available() {
 }
 
 #[test]
+fn cli_score_help_is_available() {
+    let help = assert_success(longctx().args(["score", "--help"]).output().unwrap());
+    assert!(help.contains("Run a complete scoring profile"));
+    assert!(help.contains("--profile"));
+    assert!(help.contains("max-context"));
+    assert!(help.contains("--json"));
+}
+
+#[test]
 fn cli_report_and_compare_outputs() {
     let tmp = tempdir().unwrap();
     let baseline = tmp.path().join("baseline.jsonl");

@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LongCtx Score</title>
+  <style>
+    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 32px; color: #1f2933; background: #f7f8fa; }
+    main { max-width: 1180px; margin: 0 auto; }
+    h1 { font-size: 30px; margin: 0 0 18px; }
+    h2 { font-size: 18px; margin: 0 0 10px; }
+    .summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 24px; }
+    .metric, .panel { background: #fff; border: 1px solid #d9dee7; border-radius: 8px; padding: 14px; }
+    .metric span { display: block; color: #52606d; font-size: 13px; }
+    .metric strong { display: block; font-size: 24px; margin-top: 4px; }
+    .grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr); gap: 18px; margin-bottom: 24px; }
+    table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d9dee7; table-layout: fixed; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid #e4e7ec; text-align: left; font-size: 14px; vertical-align: top; word-break: break-word; }
+    th { background: #eef1f5; font-weight: 650; }
+    .pass { color: #0b6b3a; font-weight: 650; }
+    .fail { color: #a61b1b; font-weight: 650; }
+    .muted { color: #52606d; }
+    .score { font-size: 42px; font-weight: 760; line-height: 1; }
+    @media (max-width: 820px) {
+      body { margin: 18px; }
+      .summary, .grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>LongCtx Score</h1>
+  <section class="summary">
+    <div class="metric"><span>Total score</span><strong>{{ summary.score_fmt }}/100</strong></div>
+    <div class="metric"><span>Profile</span><strong>{{ summary.profile.as_str() }}</strong></div>
+    <div class="metric"><span>Max context</span><strong>{{ max_context_display }}</strong></div>
+    <div class="metric"><span>First failure</span><strong>{{ first_failure_display }}</strong></div>
+  </section>
+  <section class="grid">
+    <div>
+      <h2>Categories</h2>
+      <table>
+        <thead><tr><th>Category</th><th>Score</th><th>Weight</th><th>Passed</th><th>Detail</th></tr></thead>
+        <tbody>
+{% for row in summary.categories %}
+          <tr><td>{{ row.name }}</td><td>{{ row.score_fmt }}/100</td><td>{{ row.weight }}</td><td>{{ row.passed }}/{{ row.total }}</td><td>{{ row.detail }}</td></tr>
+{% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h2>Provider</h2>
+      <p><strong>Model</strong><br>{{ summary.provider_model }}</p>
+      <p><strong>Base URL</strong><br>{{ summary.provider_base_url }}</p>
+      <p><strong>Request style</strong><br>{{ summary.request_style }}</p>
+      <p><strong>Run directory</strong><br><span class="muted">{{ summary.run_dir }}</span></p>
+    </div>
+  </section>
+  <h2>Context Probe Attempts</h2>
+  <table>
+    <thead><tr><th>Token count</th><th>Status</th><th>Input tokens</th><th>HTTP</th><th>Latency ms</th><th>Error kind</th></tr></thead>
+    <tbody>
+{% for row in summary.probe.attempts %}
+      <tr>
+        <td>{{ row.token_count }}</td>
+        <td>{% if row.passed %}<span class="pass">pass</span>{% else %}<span class="fail">fail</span>{% endif %}</td>
+        <td>{{ row.input_tokens }}</td>
+        <td>{% match row.http_status %}{% when Some with (status) %}{{ status }}{% when None %}{% endmatch %}</td>
+        <td>{{ row.latency_ms }}</td>
+        <td>{% match row.error_kind %}{% when Some with (kind) %}{{ kind }}{% when None %}{% endmatch %}</td>
+      </tr>
+{% endfor %}
+    </tbody>
+  </table>
+</main>
+</body>
+</html>

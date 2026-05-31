@@ -63,6 +63,26 @@ Results are written to `./bench/results.jsonl`.
 By default, `run` refuses to overwrite an existing `results.jsonl`, `run.json`, or request log. Use `--force` when intentionally replacing prior output.
 Use `--dry-run` to validate config, select tests, and resolve `context = "auto"` without reading the API key, sending provider requests, or writing results. Use `--filter <text>` to select tests whose ID or suite contains the text, and `--limit <n>` to cap the selected set.
 
+### `score`
+
+Run a complete scoring profile and write a terminal summary plus `score.json` and `score.html`.
+
+```sh
+longctx score ./score --config ./bench/config.toml
+longctx score ./score --config ./bench/config.toml --profile standard
+longctx score ./score --config ./bench/config.toml --profile max-context
+longctx score ./score --config ./bench/config.toml --profile quick --json
+```
+
+Profiles:
+
+- `quick`: low-cost smoke score, probing 8K through 64K and running 8K capability suites.
+- `standard`: recommended comparable score, probing up to 1M with 8K resolution and running 32K capability suites.
+- `deep`: higher-cost score, probing up to 1M with 4K resolution and running 128K capability suites.
+- `max-context`: only find the usable context boundary; skip capability suites.
+
+Score runs are written under `score/probe-runs/<id>/` with `score.json`, `score.html`, `probe-summary.json`, and standard per-attempt benchmark artifacts.
+
 ### `probe-context`
 
 Automatically probe a provider's usable context boundary with generated needle tests. The command starts at `--min-tokens`, doubles until `--max-tokens` or the first failure, then binary-searches the success/failure boundary until it reaches `--resolution-tokens`.
@@ -162,6 +182,12 @@ Generate the report:
 longctx report ./bench/results.jsonl
 ```
 
+Or run a single scoring command:
+
+```sh
+longctx score ./score --config ./bench/config.toml --profile quick
+```
+
 ## Config File Format
 
 `longctx run` reads `config.toml` from the benchmark directory.
@@ -212,6 +238,7 @@ When `run.log_requests` is enabled, redacted HTTP exchange logs are written to `
 Reports default to `reports/report.html` next to the results file unless `--out` is provided.
 Direct context file paths in manifests must resolve under the benchmark directory. Absolute paths and `..` paths that escape the benchmark directory are rejected before provider requests are sent.
 
+`score` writes `score.json`, `score.html`, `probe-summary.json`, and standard per-attempt benchmark artifacts under `probe-runs/<id>/`.
 `probe-context` writes timestamped probe runs under the selected output directory. Every individual probe attempt remains a standard benchmark directory, so existing `report`, `compare`, and result readers can inspect the generated artifacts.
 
 ## Automatic Context Routing

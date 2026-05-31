@@ -40,6 +40,8 @@ Run output safety:
 
 Context probing:
 
+- `longctx score ./score --config ./bench/config.toml --profile quick` is the recommended high-level entry point. It writes a terminal report, `score.json`, and `score.html`.
+- Score profiles are `quick`, `standard`, `deep`, and `max-context`. The first three combine context probing with capability suites; `max-context` only finds the context boundary.
 - `longctx probe-context ./probe --config ./bench/config.toml` runs an automated maximum-context probe against the configured provider.
 - The probe starts at `--min-tokens`, doubles until `--max-tokens` or the first failed result, then binary-searches the passing/failing boundary until `--resolution-tokens`.
 - By default it also runs a 32K-token capability pass for `multi-needle`, `conflict`, `multi-hop`, `order-dependent`, `position-sweep`, and `hallucination`; use `--skip-capabilities` to measure only the context boundary.
@@ -54,6 +56,7 @@ Generated benchmark layout:
 - `reports/http-log.jsonl`: Optional redacted request log output when enabled.
 - `run.json`: Run snapshot with timing, config metadata, and SHA256 fingerprints for manifests, contexts, and `context.index.json`.
 - `reports/report.html` by default, or an explicit `--out` path: Human-readable report output.
+- `score.json` and `score.html`: Machine-readable and human-readable score outputs from `longctx score`.
 - `probe-runs/<id>/probe-summary.json`: Machine-readable summary for `probe-context`, including attempted token counts, the best passing run, the first failing run, and optional capability summary.
 
 Result durability:

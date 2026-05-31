@@ -20,6 +20,7 @@ fn docs_cover_current_cli_and_config_surface() {
         "compare",
         "index",
         "probe-context",
+        "score",
     ] {
         assert!(
             readme.contains(command),
@@ -62,6 +63,8 @@ fn docs_cover_current_cli_and_config_surface() {
     assert!(readme.contains("MIT License"));
     assert!(readme.contains("resolution-tokens"));
     assert!(readme.contains("skip-capabilities"));
+    assert!(readme.contains("score.html"));
+    assert!(readme.contains("max-context"));
 
     let config = fs::read_to_string("docs/configuration.md")
         .expect("docs/configuration.md should be readable");
@@ -83,6 +86,8 @@ fn docs_cover_current_cli_and_config_surface() {
     assert!(config.contains("SHA256 fingerprints"));
     assert!(config.contains("probe-context"));
     assert!(config.contains("probe-summary.json"));
+    assert!(config.contains("score.json"));
+    assert!(config.contains("score.html"));
 
     let roadmap = fs::read_to_string("docs/productionization.md")
         .expect("docs/productionization.md should be readable");

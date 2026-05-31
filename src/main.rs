@@ -109,6 +109,38 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Run a complete scoring profile and write terminal, JSON, and HTML reports
+    Score {
+        /// Score output directory. Use --config or place config.toml here.
+        out_dir: String,
+        /// Config file to copy into generated benchmark directories
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+        /// Scoring profile: quick, standard, deep, or max-context
+        #[arg(long, default_value = "quick")]
+        profile: String,
+        /// Override the profile's initial context token count
+        #[arg(long)]
+        min_tokens: Option<u64>,
+        /// Override the profile's maximum context token count
+        #[arg(long)]
+        max_tokens: Option<u64>,
+        /// Override the profile's binary-search resolution
+        #[arg(long)]
+        resolution_tokens: Option<u64>,
+        /// Seed for deterministic generated benchmark data
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Override the profile's capability-suite token count
+        #[arg(long)]
+        capability_tokens: Option<u64>,
+        /// Skip capability suites and score only maximum context
+        #[arg(long)]
+        skip_capabilities: bool,
+        /// Print score.json content instead of the terminal report
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -229,6 +261,37 @@ fn main() -> anyhow::Result<()> {
             };
             let rt = tokio::runtime::Runtime::new()?;
             let summary = rt.block_on(longctx::probe::probe_context(&out_dir, options))?;
+            if json {
+                println!("{}", summary.to_json()?);
+            } else {
+                print!("{}", summary.render());
+            }
+        }
+        Commands::Score {
+            out_dir,
+            config,
+            profile,
+            min_tokens,
+            max_tokens,
+            resolution_tokens,
+            seed,
+            capability_tokens,
+            skip_capabilities,
+            json,
+        } => {
+            let profile = longctx::score::ScoreProfile::parse(&profile)?;
+            let options = longctx::score::ScoreOptions {
+                profile,
+                config_path: config,
+                min_tokens,
+                max_tokens,
+                resolution_tokens,
+                seed,
+                capability_tokens,
+                skip_capabilities,
+            };
+            let rt = tokio::runtime::Runtime::new()?;
+            let summary = rt.block_on(longctx::score::score_provider(&out_dir, options))?;
             if json {
                 println!("{}", summary.to_json()?);
             } else {
