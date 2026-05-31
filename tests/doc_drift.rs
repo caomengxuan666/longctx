@@ -55,6 +55,7 @@ fn docs_cover_current_cli_and_config_surface() {
     assert!(config.contains("LLM judge auditing"));
     assert!(config.contains("--limit"));
     assert!(config.contains("Context file safety"));
+    assert!(config.contains("Result durability"));
 
     let roadmap = fs::read_to_string("docs/productionization.md")
         .expect("docs/productionization.md should be readable");
@@ -62,4 +63,5 @@ fn docs_cover_current_cli_and_config_surface() {
     assert!(roadmap.contains("request IDs"));
     assert!(roadmap.contains("license"));
     assert!(roadmap.contains("MSRV 1.81"));
+    assert!(roadmap.contains("Durable result writes"));
 }

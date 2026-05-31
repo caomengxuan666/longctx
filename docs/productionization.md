@@ -41,6 +41,7 @@ The next work should make the loop dependable enough for repeat use.
 - Result reader guards for unsupported future schema versions and duplicate comparison IDs.
 - Structured LLM judge failure reporting with judge status, attempts, token, latency, and error metadata.
 - Dry-run, filter, and limit controls for targeted benchmark execution.
+- Durable result writes that flush each completed row during long runs.
 
 ## Next priorities
 
@@ -53,7 +54,6 @@ The next work should make the loop dependable enough for repeat use.
 - Decide and add the project license before publishing to crates.io.
 - Keep release automation attached to `v*` tags with test gates, target-named archives, SHA256 checksums, and GitHub Release assets.
 - Keep CI coverage on Linux stable, MSRV 1.81, and platform tests for macOS and Windows.
-- Add durable streaming result writes so completed rows survive an interrupted long run.
 
 ### P2
 

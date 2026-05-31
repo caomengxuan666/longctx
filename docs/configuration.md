@@ -48,6 +48,10 @@ Generated benchmark layout:
 - `run.json`: Run snapshot with timing and config metadata.
 - `report.html` or `reports/*.html`: Human-readable report output.
 
+Result durability:
+
+- Completed test results are written and flushed to `results.jsonl` as each task finishes, so interrupted long runs keep valid rows for tests that completed before the interruption.
+
 Context file safety:
 
 - Direct `context` file paths must resolve under the benchmark directory.

@@ -112,12 +112,10 @@ pub async fn run_benchmarks_with_options(bench_dir: &str, options: RunOptions) -
         tests_for_run,
         context_index,
         &counter,
+        &mut results_file,
     )
     .await?;
 
-    for result in &results {
-        writeln!(results_file, "{}", serde_json::to_string(&result)?)?;
-    }
     if config.run.log_requests {
         let log_path = request_log_path
             .as_deref()
@@ -423,6 +421,7 @@ async fn run_all(
     tests: Vec<TestCase>,
     context_index: Option<ContextIndex>,
     counter: &TokenCounter,
+    results_file: &mut impl Write,
 ) -> Result<Vec<BenchmarkResult>> {
     let concurrency = run.concurrency.max(1);
     let total = tests.len();
@@ -436,6 +435,7 @@ async fn run_all(
                 .await
                 .context("benchmark task set ended unexpectedly")?
                 .context("benchmark task panicked")?;
+            write_result_row(results_file, &result)?;
             ordered[completed_idx] = Some(result);
         }
 
@@ -466,6 +466,7 @@ async fn run_all(
 
     while let Some(joined) = tasks.join_next().await {
         let (idx, result) = joined.context("benchmark task panicked")?;
+        write_result_row(results_file, &result)?;
         ordered[idx] = Some(result);
     }
 
@@ -474,6 +475,12 @@ async fn run_all(
         .enumerate()
         .map(|(idx, result)| result.with_context(|| format!("missing result for test index {idx}")))
         .collect()
+}
+
+fn write_result_row(writer: &mut impl Write, result: &BenchmarkResult) -> Result<()> {
+    writeln!(writer, "{}", serde_json::to_string(result)?)?;
+    writer.flush()?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2017,6 +2024,110 @@ model = "example-model"
 
         assert_eq!(result.answer, "ok");
         assert_eq!(result.attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn run_all_writes_and_flushes_completed_results_before_slow_tasks_finish() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("fast question"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "FAST"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 1}
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("slow question"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(1_500))
+                    .set_body_json(serde_json::json!({
+                        "choices": [{"message": {"role": "assistant", "content": "SLOW"}}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 1}
+                    })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("contexts")).unwrap();
+        fs::write(tmp.path().join("contexts/fast.txt"), "fast context").unwrap();
+        fs::write(tmp.path().join("contexts/slow.txt"), "slow context").unwrap();
+        let results_path = tmp.path().join("results.jsonl");
+        let tests = vec![
+            TestCase {
+                schema_version: SCHEMA_VERSION,
+                id: "slow".to_string(),
+                context: "contexts/slow.txt".to_string(),
+                question: "slow question".to_string(),
+                expected: vec!["SLOW".to_string()],
+                grader: crate::benchmark::Grader::Exact,
+                metadata: BTreeMap::new(),
+            },
+            TestCase {
+                schema_version: SCHEMA_VERSION,
+                id: "fast".to_string(),
+                context: "contexts/fast.txt".to_string(),
+                question: "fast question".to_string(),
+                expected: vec!["FAST".to_string()],
+                grader: crate::benchmark::Grader::Exact,
+                metadata: BTreeMap::new(),
+            },
+        ];
+        let client = Client::builder().build().unwrap();
+        let provider = ProviderConfig {
+            base_url: mock_server.uri(),
+            api_key_env: "TEST_KEY".to_string(),
+            model: "test-model".to_string(),
+            request_style: crate::benchmark::ProviderRequestStyle::ChatCompletions,
+        };
+        let run = RunConfig {
+            concurrency: 2,
+            ..Default::default()
+        };
+        let bench_path = tmp.path().to_path_buf();
+        let path_for_task = results_path.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path_for_task)
+                .unwrap();
+            let counter = TokenCounter::cl100k();
+            run_all(
+                client,
+                provider,
+                run,
+                GraderConfig::default(),
+                "test-key".to_string(),
+                bench_path,
+                tests,
+                None,
+                &counter,
+                &mut file,
+            )
+            .await
+            .unwrap()
+        });
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let partial = fs::read_to_string(&results_path).unwrap();
+        assert!(partial.contains("\"id\":\"fast\""));
+        assert!(!partial.contains("\"id\":\"slow\""));
+
+        let results = handle.await.unwrap();
+        assert_eq!(results[0].id, "slow");
+        assert_eq!(results[1].id, "fast");
+        let final_results = fs::read_to_string(&results_path).unwrap();
+        assert!(final_results.contains("\"id\":\"slow\""));
     }
 
     #[tokio::test]
