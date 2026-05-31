@@ -60,6 +60,16 @@ longctx validate ./bench
 
 Use `--skip-api-key-check` when you only want to check files and schema.
 
+### `index`
+
+Build or refresh the context index used by automatic context routing.
+
+```sh
+longctx index ./bench
+```
+
+Generated suites write this index automatically. Run `index` after hand-editing manifests or context files.
+
 ### `report`
 
 Generate a standalone HTML report from a results JSONL file.
@@ -71,6 +81,7 @@ longctx report ./bench/results.jsonl --json --out report.json
 ```
 
 The report includes per-suite summaries, per-token-count summaries, trend charts, and failure groups.
+When result rows include automatic routing decisions, the report shows the selected context, routing method, status, and confidence.
 `--json` emits a machine-readable summary.
 
 ### `compare`
@@ -164,11 +175,20 @@ Each generated suite writes:
 
 - A context text file under `contexts/`.
 - A suite manifest JSON file under `manifests/`.
+- A context routing index at `context.index.json`.
 
 The runner accepts generated suite manifests and writes newline-delimited JSON results to `results.jsonl`.
-Result rows include the suite name, token count, provider model, HTTP status, provider request ID, rate-limit headers, attempt count, and structured error kind when a run fails.
+Result rows include the suite name, token count, provider model, HTTP status, provider request ID, rate-limit headers, attempt count, structured error kind when a run fails, and optional routing audit details.
 Each run also writes a `run.json` snapshot with config and timing metadata.
 When `run.log_requests` is enabled, redacted HTTP exchange logs are written to `reports/http-log.jsonl`.
+
+## Automatic Context Routing
+
+Set a test case's `context = "auto"` to let the runner select a context file from `context.index.json` instead of naming a file directly.
+
+The first implementation is a zero-token local router. It scores context-level index entries using safe manifest metadata, test IDs, suite names, token counts, and lexical overlap with the question. It does not call an LLM router and does not inspect `expected` answers. If routing is ambiguous, the result fails with `error_kind = "ContextRoute"` instead of silently choosing a weak candidate.
+
+Routing decisions are written into each result row under `routing`, including selected context path, candidate scores, method, status, confidence, token usage, and latency fields. The token and latency fields are currently zero because the local router does not spend model tokens.
 
 ## Contributing
 

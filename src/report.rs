@@ -59,6 +59,8 @@ struct ResultRow {
     rate_limit_remaining_display: String,
     rate_limit_reset_display: String,
     error_kind_display: String,
+    routing_display: String,
+    routing_context_display: String,
     answer_display: String,
     error_display: String,
 }
@@ -106,6 +108,17 @@ pub fn generate_html(results_path: &str, out_path: &str) -> Result<()> {
             } else {
                 ("fail", "fail")
             };
+            let routing_display = result.routing.as_ref().map_or_else(String::new, |routing| {
+                format!(
+                    "{} / {} / {:.2}",
+                    routing.status, routing.method, routing.confidence
+                )
+            });
+            let routing_context_display = result
+                .routing
+                .as_ref()
+                .and_then(|routing| routing.selected_context_path.clone())
+                .unwrap_or_default();
             ResultRow {
                 id: result.id.clone(),
                 suite_display: result.suite.clone().unwrap_or_default(),
@@ -134,6 +147,8 @@ pub fn generate_html(results_path: &str, out_path: &str) -> Result<()> {
                     .as_ref()
                     .map(|k| format!("{k:?}"))
                     .unwrap_or_default(),
+                routing_display,
+                routing_context_display,
                 answer_display: result.answer.clone().unwrap_or_default(),
                 error_display: result.error.clone().unwrap_or_default(),
             }
@@ -373,6 +388,25 @@ mod tests {
     }
 
     #[test]
+    fn report_includes_routing_decision_columns() {
+        let tmp = tempdir().unwrap();
+        let results = tmp.path().join("results.jsonl");
+        let out = tmp.path().join("report.html");
+        fs::write(
+            &results,
+            r#"{"schema_version":1,"suite":"needle","token_count":100000,"id":"a","provider_model":"gpt-4.1","provider_base_url":"https://api.openai.com/v1","http_status":200,"request_id":"req_1","rate_limit_remaining":"9","rate_limit_reset":"60","passed":true,"attempts":1,"latency_ms":10,"input_tokens":100,"output_tokens":5,"answer":"A","error":null,"error_kind":null,"routing":{"schema_version":1,"test_id":"a","selected_context_id":"needle_context","selected_context_path":"contexts/needle_context.txt","method":"hybrid","status":"selected","confidence":0.9,"candidates":[],"llm_router_used":false,"input_tokens":0,"output_tokens":0,"latency_ms":0,"reason":"local_router_selected_top_candidate"}}
+"#,
+        )
+        .unwrap();
+
+        generate_html(results.to_str().unwrap(), out.to_str().unwrap()).unwrap();
+        let html = fs::read_to_string(out).unwrap();
+        assert!(html.contains("Routing"));
+        assert!(html.contains("selected / hybrid / 0.90"));
+        assert!(html.contains("contexts/needle_context.txt"));
+    }
+
+    #[test]
     fn summary_json_includes_aggregates() {
         let tmp = tempdir().unwrap();
         let results = tmp.path().join("results.jsonl");
@@ -447,6 +481,7 @@ mod tests {
             answer: None,
             error: None,
             error_kind: Some(crate::benchmark::ErrorKind::Http),
+            routing: None,
             judge_latency_ms: None,
             judge_input_tokens: None,
             metadata: BTreeMap::new(),

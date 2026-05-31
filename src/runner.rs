@@ -1,6 +1,9 @@
 use crate::benchmark::{
-    BenchmarkResult, Config, ErrorKind, GraderConfig, ProviderConfig, RunConfig, RunMetadata,
-    SuiteManifest, TestCase, SCHEMA_VERSION,
+    BenchmarkResult, Config, ErrorKind, GraderConfig, ProviderConfig, RoutingDecision, RunConfig,
+    RunMetadata, SuiteManifest, TestCase, SCHEMA_VERSION,
+};
+use crate::context_index::{
+    is_auto_context, load_or_build_context_index, route_context, write_context_index, ContextIndex,
 };
 use crate::grader::{grade, grade_with_llm};
 use crate::tokenizer::TokenCounter;
@@ -32,6 +35,13 @@ pub async fn run_benchmarks(bench_dir: &str) -> Result<()> {
     if tests.is_empty() {
         return Err(anyhow!("no benchmark .json files found in {bench_dir}"));
     }
+    let context_index = if tests.iter().any(|test| is_auto_context(&test.context)) {
+        let index = load_or_build_context_index(bench_path)?;
+        write_context_index(bench_path, &index)?;
+        Some(index)
+    } else {
+        None
+    };
 
     let results_path = bench_path.join("results.jsonl");
     let metadata_path = bench_path.join("run.json");
@@ -66,6 +76,7 @@ pub async fn run_benchmarks(bench_dir: &str) -> Result<()> {
         api_key,
         bench_path.to_path_buf(),
         tests_for_run,
+        context_index,
         &counter,
     )
     .await?;
@@ -140,7 +151,12 @@ fn write_request_logs(
         .with_context(|| format!("failed to open request log {}", log_path.display()))?;
 
     for (test, result) in tests.iter().zip(results.iter()) {
-        let request_hash = load_context(bench_path, &test.context)
+        let context_path = result
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.selected_context_path.as_deref())
+            .unwrap_or(&test.context);
+        let request_hash = load_context(bench_path, context_path)
             .map(|context| build_prompt(&context, &test.question))
             .map(|prompt| sha256_hex(&prompt))
             .ok();
@@ -200,6 +216,7 @@ async fn run_all(
     api_key: String,
     bench_path: PathBuf,
     tests: Vec<TestCase>,
+    context_index: Option<ContextIndex>,
     counter: &TokenCounter,
 ) -> Result<Vec<BenchmarkResult>> {
     let concurrency = run.concurrency.max(1);
@@ -223,6 +240,7 @@ async fn run_all(
         let grader_config = grader_config.clone();
         let api_key = api_key.clone();
         let bench_path = bench_path.clone();
+        let context_index = context_index.clone();
         let counter = counter.clone();
         tasks.spawn(async move {
             let result = run_one(
@@ -233,6 +251,7 @@ async fn run_all(
                 &api_key,
                 &bench_path,
                 &test,
+                context_index.as_ref(),
                 &counter,
             )
             .await;
@@ -261,10 +280,40 @@ async fn run_one(
     api_key: &str,
     bench_dir: &Path,
     test: &TestCase,
+    context_index: Option<&ContextIndex>,
     counter: &TokenCounter,
 ) -> BenchmarkResult {
     let started = Instant::now();
-    let context = match load_context(bench_dir, &test.context) {
+    let (context_ref, routing) = match resolve_context_reference(test, context_index) {
+        Ok(resolved) => resolved,
+        Err((error, routing)) => {
+            return BenchmarkResult {
+                schema_version: SCHEMA_VERSION,
+                suite: suite_name(test),
+                token_count: test_token_count(test),
+                id: test.id.clone(),
+                provider_model: Some(provider.model.clone()),
+                provider_base_url: Some(provider.base_url.clone()),
+                http_status: None,
+                request_id: None,
+                rate_limit_remaining: None,
+                rate_limit_reset: None,
+                passed: false,
+                attempts: 0,
+                latency_ms: started.elapsed().as_millis() as u64,
+                input_tokens: 0,
+                output_tokens: 0,
+                answer: None,
+                error: Some(error),
+                error_kind: Some(ErrorKind::ContextRoute),
+                routing,
+                judge_latency_ms: None,
+                judge_input_tokens: None,
+                metadata: test.metadata.clone(),
+            };
+        }
+    };
+    let context = match load_context(bench_dir, &context_ref) {
         Ok(context) => context,
         Err(error) => {
             return BenchmarkResult {
@@ -286,6 +335,7 @@ async fn run_one(
                 answer: None,
                 error: Some(error.to_string()),
                 error_kind: Some(ErrorKind::ContextLoad),
+                routing,
                 judge_latency_ms: None,
                 judge_input_tokens: None,
                 metadata: test.metadata.clone(),
@@ -376,6 +426,7 @@ async fn run_one(
                 } else {
                     Some(ErrorKind::Validation)
                 },
+                routing,
                 judge_latency_ms: judge_lat,
                 judge_input_tokens: judge_tok,
                 metadata: test.metadata.clone(),
@@ -392,6 +443,7 @@ async fn run_one(
             request_id: failure.request_id,
             rate_limit_remaining: failure.rate_limit_remaining,
             rate_limit_reset: failure.rate_limit_reset,
+            routing,
             error: failure.error,
         }),
     }
@@ -660,6 +712,7 @@ struct ErrorResultInput<'a, E> {
     request_id: Option<String>,
     rate_limit_remaining: Option<String>,
     rate_limit_reset: Option<String>,
+    routing: Option<RoutingDecision>,
     error: E,
 }
 
@@ -683,9 +736,41 @@ fn error_result<E: std::fmt::Display>(input: ErrorResultInput<'_, E>) -> Benchma
         answer: None,
         error: Some(input.error.to_string()),
         error_kind: Some(input.kind),
+        routing: input.routing,
         judge_latency_ms: None,
         judge_input_tokens: None,
         metadata: input.test.metadata.clone(),
+    }
+}
+
+fn resolve_context_reference(
+    test: &TestCase,
+    context_index: Option<&ContextIndex>,
+) -> std::result::Result<(String, Option<RoutingDecision>), (String, Option<RoutingDecision>)> {
+    if !is_auto_context(&test.context) {
+        return Ok((test.context.clone(), None));
+    }
+
+    let Some(index) = context_index else {
+        return Err((
+            "context routing requested but context index is unavailable".to_string(),
+            None,
+        ));
+    };
+
+    let decision = route_context(test, index);
+    if let Some(path) = decision.selected_context_path.clone() {
+        Ok((path, Some(decision)))
+    } else {
+        let message = format!(
+            "context routing failed for {}: {}",
+            test.id,
+            decision
+                .reason
+                .as_deref()
+                .unwrap_or("no context candidate selected")
+        );
+        Err((message, Some(decision)))
     }
 }
 
@@ -1174,6 +1259,7 @@ request_style = "responses"
             answer: Some("orchid-123".to_string()),
             error: None,
             error_kind: None,
+            routing: None,
             judge_latency_ms: None,
             judge_input_tokens: None,
             metadata: BTreeMap::new(),

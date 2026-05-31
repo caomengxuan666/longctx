@@ -1,4 +1,8 @@
-use crate::benchmark::{Config, TestCase, SCHEMA_VERSION};
+use crate::benchmark::{Config, Grader, TestCase, SCHEMA_VERSION};
+use crate::context_index::{
+    is_auto_context, load_or_build_context_index, read_context_index, validate_context_index,
+    CONTEXT_INDEX_FILE,
+};
 use crate::runner::{read_config, read_tests};
 use anyhow::{bail, Context, Result};
 use std::env;
@@ -30,6 +34,16 @@ pub fn validate_benchmark_dir(bench_dir: &str, check_api_key: bool) -> Result<Va
 
     for test in &tests {
         validate_test(bench_path, test)?;
+    }
+    if tests.iter().any(|test| is_auto_context(&test.context)) {
+        let index = load_or_build_context_index(bench_path)?;
+        validate_context_index(bench_path, &index)?;
+    } else {
+        let index_path = bench_path.join(CONTEXT_INDEX_FILE);
+        if index_path.exists() {
+            let index = read_context_index(&index_path)?;
+            validate_context_index(bench_path, &index)?;
+        }
     }
 
     Ok(ValidationSummary {
@@ -88,8 +102,11 @@ fn validate_test(bench_dir: &Path, test: &TestCase) -> Result<()> {
     if test.question.trim().is_empty() {
         bail!("test {} question must not be empty", test.id);
     }
-    if test.expected.is_empty() {
+    if test.expected.is_empty() && !matches!(test.grader, Grader::ExpectRefusal) {
         bail!("test {} expected answers must not be empty", test.id);
+    }
+    if is_auto_context(&test.context) {
+        return Ok(());
     }
     if !context_is_resolvable(bench_dir, &test.context) {
         bail!(
@@ -263,6 +280,36 @@ concurrency = 0
 
         let error = validate_benchmark_dir(tmp.path().to_str().unwrap(), false).unwrap_err();
         assert!(error.to_string().contains("concurrency"));
+    }
+
+    #[test]
+    fn validate_accepts_expect_refusal_without_expected_answers() {
+        let tmp = tempdir().unwrap();
+        write_valid_fixture(tmp.path());
+        fs::write(
+            tmp.path().join("manifests/needle.json"),
+            r#"
+{
+  "schema_version": 1,
+  "name": "hallucination",
+  "token_count": 100,
+  "seed": 7,
+  "suites": [{
+    "schema_version": 1,
+    "id": "hallucination-100",
+    "context": "contexts/needle_context.txt",
+    "question": "What is the missing code?",
+    "expected": [],
+    "grader": "ExpectRefusal",
+    "metadata": {"suite": "hallucination"}
+  }]
+}
+"#,
+        )
+        .unwrap();
+
+        let summary = validate_benchmark_dir(tmp.path().to_str().unwrap(), false).unwrap();
+        assert_eq!(summary.test_count, 1);
     }
 
     #[test]

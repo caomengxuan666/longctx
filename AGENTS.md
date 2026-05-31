@@ -8,6 +8,8 @@ Working rules for future edits:
 - Preserve backwards compatibility when possible. The runner should keep reading older flat layouts and old JSON artifacts.
 - Treat `schema_version` as the compatibility marker for generated manifests and results.
 - Keep benchmark outputs under `bench/contexts`, `bench/manifests`, `bench/results.jsonl`, and `bench/reports`.
+- Keep `context = "auto"` routing zero-token and auditable unless a future change explicitly introduces an opt-in LLM router.
+- Do not use `expected` answers or answer-like metadata as router input.
 - Prefer small, focused changes over wide refactors.
 - Update docs whenever CLI flags, config fields, output layout, or result schema change.
 - Add tests for generator, grader, runner config parsing, and report generation when touching those areas.

@@ -1,4 +1,5 @@
 use crate::benchmark::{Grader, SuiteManifest, TestCase, SCHEMA_VERSION};
+use crate::context_index::{build_context_index, write_context_index};
 use crate::tokenizer::TokenCounter;
 use anyhow::{bail, Context, Result};
 use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
@@ -59,6 +60,8 @@ pub fn generate(
     let json = serde_json::to_string_pretty(&manifest)?;
     fs::write(&manifest_path, json)
         .with_context(|| format!("failed to write manifest {}", manifest_path.display()))?;
+    let index = build_context_index(out_dir)?;
+    write_context_index(out_dir, &index)?;
     Ok(())
 }
 

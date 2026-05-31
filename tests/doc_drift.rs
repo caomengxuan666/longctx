@@ -3,7 +3,7 @@ use std::fs;
 #[test]
 fn docs_cover_current_cli_and_config_surface() {
     let readme = fs::read_to_string("README.md").expect("README.md should be readable");
-    for command in ["generate", "run", "validate", "report", "compare"] {
+    for command in ["generate", "run", "validate", "report", "compare", "index"] {
         assert!(
             readme.contains(command),
             "README.md should mention the {command} command"
@@ -27,6 +27,8 @@ fn docs_cover_current_cli_and_config_surface() {
     assert!(readme.contains("request_log_path"));
     assert!(readme.contains("request_style"));
     assert!(readme.contains("judge_model"));
+    assert!(readme.contains("context = \"auto\""));
+    assert!(readme.contains("context.index.json"));
 
     let config = fs::read_to_string("docs/configuration.md")
         .expect("docs/configuration.md should be readable");
@@ -34,6 +36,7 @@ fn docs_cover_current_cli_and_config_surface() {
     assert!(config.contains("run.log_requests"));
     assert!(config.contains("run.request_log_path"));
     assert!(config.contains("reports/http-log.jsonl"));
+    assert!(config.contains("context.index.json"));
 
     let roadmap = fs::read_to_string("docs/productionization.md")
         .expect("docs/productionization.md should be readable");

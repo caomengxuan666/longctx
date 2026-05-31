@@ -34,6 +34,8 @@ The next work should make the loop dependable enough for repeat use.
 - CI checks for formatting, linting, unit tests, builds, and doc drift.
 - Machine-readable report summary exports.
 - Provider-specific adapters for chat completions and responses APIs.
+- Zero-token automatic context routing with a reproducible `context.index.json`.
+- Per-result routing audit metadata and report columns for routed runs.
 
 ## Next priorities
 

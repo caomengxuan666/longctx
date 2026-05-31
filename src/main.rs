@@ -63,6 +63,11 @@ enum Commands {
         #[arg(long)]
         skip_api_key_check: bool,
     },
+    /// Build or refresh the context index used by auto routing
+    Index {
+        /// Benchmark directory containing manifests and contexts
+        bench_dir: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -128,6 +133,12 @@ fn main() -> anyhow::Result<()> {
                 "validated {} tests with model {}",
                 summary.test_count, summary.config_model
             );
+        }
+        Commands::Index { bench_dir } => {
+            let bench_path = std::path::Path::new(&bench_dir);
+            let index = longctx::context_index::build_context_index(bench_path)?;
+            longctx::context_index::write_context_index(bench_path, &index)?;
+            println!("indexed {} contexts", index.contexts.len());
         }
     }
     Ok(())
